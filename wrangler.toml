@@ -3,14 +3,11 @@ main = "src/index.ts"
 compatibility_date = "2025-12-06"
 
 [vars]
-# Keep dummy here; real token will be stored as a secret.
-TELEGRAM_BOT_TOKEN = "dummy"
+TELEGRAM_BOT_TOKEN = "8580301156:AAFx2ho_dhgNBVCzSZjNIaDQes-jPOnH3RQ"
 
-[kv_namespaces]
-# Create a KV namespace in Cloudflare called "BOT_CONFIG" and paste the IDs.
-bindings = [
-  { binding = "BOT_CONFIG", id = "YOUR_KV_ID", preview_id = "YOUR_KV_PREVIEW_ID" }
-]
+[[kv_namespaces]]
+binding = "BOT_CONFIG"
+id = "1b765d912d3542479132bd4b42465e3f"
 
 [observability]
 enabled = true
