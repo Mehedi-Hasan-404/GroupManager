@@ -1,0 +1,16 @@
+name = "telegram-group-manager-bot"
+main = "src/index.ts"
+compatibility_date = "2025-12-06"
+
+[vars]
+# Keep dummy here; real token will be stored as a secret.
+TELEGRAM_BOT_TOKEN = "dummy"
+
+[kv_namespaces]
+# Create a KV namespace in Cloudflare called "BOT_CONFIG" and paste the IDs.
+bindings = [
+  { binding = "BOT_CONFIG", id = "YOUR_KV_ID", preview_id = "YOUR_KV_PREVIEW_ID" }
+]
+
+[observability]
+enabled = true
