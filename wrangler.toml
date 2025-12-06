@@ -9,5 +9,8 @@ TELEGRAM_BOT_TOKEN = "8580301156:AAFx2ho_dhgNBVCzSZjNIaDQes-jPOnH3RQ"
 binding = "BOT_CONFIG"
 id = "1b765d912d3542479132bd4b42465e3f"
 
+[triggers]
+crons = [*/1 * * * *]
+
 [observability]
 enabled = true
