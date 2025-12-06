@@ -1,4 +1,4 @@
-name: Deploy Cloudflare Worker
+name: Deploy Telegram Bot
 
 on:
   push:
