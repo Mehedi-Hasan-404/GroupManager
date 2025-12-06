@@ -2,7 +2,7 @@ const TG_API_BASE = "https://api.telegram.org";
 
 export interface Env {
   TELEGRAM_BOT_TOKEN: string;
-  KV_BINDING: KVNamespace;
+  BOT_CONFIG: KVNamespace;
 }
 
 interface TelegramUser {
@@ -15,9 +15,8 @@ interface TelegramUser {
 
 interface TelegramChat {
   id: number;
-  type: "private" | "group" | "supergroup" | "channel" | string;
+  type: string;
   title?: string;
-  username?: string;
 }
 
 interface TelegramMessage {
@@ -34,11 +33,15 @@ interface TelegramUpdate {
   message?: TelegramMessage;
 }
 
-type GroupSettings = {
-  autoMuteAfterViolations: number;
-  autoMuteDurationMinutes: number;
-  manualMuteDefaultMinutes: number;
-};
+interface KVListKey {
+  name: string;
+}
+
+interface KVListResult {
+  keys: KVListKey[];
+  list_complete: boolean;
+  cursor?: string;
+}
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -53,128 +56,152 @@ export default {
       return new Response("Bad Request", { status: 400 });
     }
 
-    if (!update || !update.message) {
-      return new Response("OK");
+    if (update && update.message) {
+      ctx.waitUntil(handleMessage(update.message, env));
     }
 
-    ctx.waitUntil(handleMessage(update.message, env));
     return new Response("OK");
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(processScheduledDeletes(env));
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(processDeleteTasks(env));
   }
 };
 
 async function handleMessage(message: TelegramMessage, env: Env): Promise<void> {
   const chat = message.chat;
-  const user = message.from;
+  const from = message.from;
   const chatId = chat.id.toString();
-
-  if (chat.type === "private") {
-    const text = message.text || "";
-    if (text.startsWith("/start") || text.startsWith("/help")) {
-      await sendText(
-        chatId,
-        "Hi! Add me to groups as admin.\n\nI can:\n- Delete ALL links\n- Auto-mute spammers\n- /mute & /unmute users (reply)\n- /delafter 10s (reply) to delete later\n- /settings to see config\n- /set to change config\nIn private chat, send /groups to see groups.",
-        env
-      );
-    } else if (text.startsWith("/groups")) {
-      await showGroups(chatId, env);
-    } else {
-      await sendText(chatId, "Use /help to see what I can do.", env);
-    }
-    return;
-  }
-
-  if (chat.type !== "group" && chat.type !== "supergroup") {
-    return;
-  }
-
-  await trackGroup(chat, env);
-
   const text = message.text || message.caption || "";
 
-  if (text.startsWith("/")) {
-    await handleCommand(message, env);
+  if (chat.type === "private") {
+    await handlePrivateMessage(message, env);
     return;
   }
 
-  if (!user) return;
+  if (chat.type === "group" || chat.type === "supergroup") {
+    await saveGroupInfo(chat, env);
+    if (from && from.username) {
+      await saveUsername(chatId, from.username, from.id, env);
+    }
 
-  const settings = await getSettings(chatId, env);
+    if (text.startsWith("/")) {
+      await handleGroupCommand(message, env);
+      return;
+    }
 
-  if (containsLink(text)) {
-    await deleteMessage(chatId, message.message_id, env);
-    await handleRuleViolation(chatId, user.id, settings, env);
-    return;
-  }
-}
+    if (!from) return;
 
-/* SETTINGS & GROUPS */
-
-function defaultSettings(): GroupSettings {
-  return {
-    autoMuteAfterViolations: 3,
-    autoMuteDurationMinutes: 30,
-    manualMuteDefaultMinutes: 24 * 60
-  };
-}
-
-async function getSettings(chatId: string, env: Env): Promise<GroupSettings> {
-  const key = `settings:${chatId}`;
-  const raw = await env.KV_BINDING.get(key);
-  if (!raw) return defaultSettings();
-  try {
-    const parsed = JSON.parse(raw);
-    return { ...defaultSettings(), ...parsed };
-  } catch {
-    return defaultSettings();
-  }
-}
-
-async function saveSettings(chatId: string, settings: GroupSettings, env: Env): Promise<void> {
-  const key = `settings:${chatId}`;
-  await env.KV_BINDING.put(key, JSON.stringify(settings));
-}
-
-async function trackGroup(chat: TelegramChat, env: Env): Promise<void> {
-  if (chat.type !== "group" && chat.type !== "supergroup") return;
-  const key = `group:${chat.id}`;
-  const data = {
-    id: chat.id,
-    type: chat.type,
-    title: chat.title || "",
-    username: chat.username || ""
-  };
-  await env.KV_BINDING.put(key, JSON.stringify(data));
-}
-
-async function showGroups(chatId: string, env: Env): Promise<void> {
-  const list = await env.KV_BINDING.list({ prefix: "group:", limit: 50 });
-  if (list.keys.length === 0) {
-    await sendText(chatId, "I don't see any groups yet. Add me as admin to your groups.", env);
-    return;
-  }
-
-  let text = "Groups I know:\n\n";
-  for (const k of list.keys) {
-    const raw = await env.KV_BINDING.get(k.name);
-    if (!raw) continue;
-    try {
-      const g = JSON.parse(raw) as { id: number; title: string; username?: string };
-      const title = g.title || "(no title)";
-      const handle = g.username ? ` (@${g.username})` : "";
-      text += `- ${title}${handle} (ID: ${g.id})\n`;
-    } catch {
-      continue;
+    if (containsLink(text)) {
+      await deleteMessage(chatId, message.message_id, env);
+      await handleRuleViolation(chatId, from.id, env);
+      return;
     }
   }
-
-  await sendText(chatId, text, env);
 }
 
-/* LINK + VIOLATIONS */
+async function handlePrivateMessage(message: TelegramMessage, env: Env): Promise<void> {
+  const chatId = message.chat.id;
+  const text = message.text || "";
+
+  if (text.startsWith("/start")) {
+    await sendText(
+      chatId,
+      "Hi! Add me to groups as admin.\n\nI will:\n- Delete ALL links\n- Auto-mute users after 3 link violations\n- Let admins /mute, /unmute\n- Let admins schedule deletes with /del 10s, /del 10m\n\nUse /groups (here in private chat) to see groups I am in.",
+      env
+    );
+    return;
+  }
+
+  if (text.startsWith("/groups")) {
+    await listGroups(chatId, env);
+    return;
+  }
+
+  if (text.startsWith("/help")) {
+    await sendText(
+      chatId,
+      "Commands:\n/groups - show groups where I am added\nAdd me to a group and make me admin to start moderating.",
+      env
+    );
+    return;
+  }
+
+  await sendText(chatId, "Add me to a group and make me admin.\nUse /groups here to see groups.", env);
+}
+
+async function handleGroupCommand(message: TelegramMessage, env: Env): Promise<void> {
+  const chat = message.chat;
+  const chatId = chat.id.toString();
+  const from = message.from;
+  const text = message.text || "";
+
+  if (!from) return;
+
+  const [rawCmd, ...args] = text.split(" ");
+  const cmd = rawCmd.split("@")[0];
+
+  const admin = await isAdmin(chatId, from.id, env);
+
+  switch (cmd) {
+    case "/mute": {
+      if (!admin) return;
+      const target = await resolveTargetUser(message, args, env);
+      if (!target) {
+        await sendText(chatId, "Reply to a user's message or use /mute @username 10m", env);
+        return;
+      }
+      const durationMinutes = parseDurationToMinutes(args[args.length - 1]);
+      await muteUser(chatId, target.id, durationMinutes, env);
+      await sendText(chatId, `Muted ${displayName(target)} for ${formatDuration(durationMinutes)}.`, env);
+      break;
+    }
+
+    case "/unmute": {
+      if (!admin) return;
+      const target = await resolveTargetUser(message, args, env);
+      if (!target) {
+        await sendText(chatId, "Reply to a user's message or use /unmute @username", env);
+        return;
+      }
+      await unmuteUser(chatId, target.id, env);
+      await sendText(chatId, `Unmuted ${displayName(target)}.`, env);
+      break;
+    }
+
+    case "/del": {
+      if (!admin) return;
+      const reply = message.reply_to_message;
+      if (!reply) {
+        await sendText(chatId, "Reply to a message with /del 10s or /del 10m or /del 1h", env);
+        return;
+      }
+      const seconds = parseDurationToSeconds(args[0]);
+      const deleteAt = Math.floor(Date.now() / 1000) + seconds;
+      const key = `delete_task:${chatId}:${reply.message_id}`;
+      const value = JSON.stringify({
+        chatId,
+        messageId: reply.message_id,
+        deleteAt
+      });
+      await env.BOT_CONFIG.put(key, value);
+      await sendText(chatId, `I will delete that message in ${formatDurationSeconds(seconds)}.`, env);
+      break;
+    }
+
+    case "/help": {
+      await sendText(
+        chatId,
+        "Group commands (admins only):\n/mute [time] (reply or @username)\n/unmute (reply or @username)\n/del <time> (reply) - delete msg later\n\nTime examples: 10s, 10m, 1h, 1d.",
+        env
+      );
+      break;
+    }
+
+    default:
+      break;
+  }
+}
 
 function containsLink(text: string | undefined): boolean {
   if (!text) return false;
@@ -189,199 +216,17 @@ function containsLink(text: string | undefined): boolean {
   return patterns.some((rx) => rx.test(text));
 }
 
-async function handleRuleViolation(
-  chatId: string,
-  userId: number,
-  settings: GroupSettings,
-  env: Env
-): Promise<void> {
+async function handleRuleViolation(chatId: string, userId: number, env: Env): Promise<void> {
   const key = `violations:${chatId}:${userId}`;
-  const current = (await env.KV_BINDING.get(key)) || "0";
+  const current = (await env.BOT_CONFIG.get(key)) || "0";
   const count = parseInt(current, 10) || 0;
   const newCount = count + 1;
-  await env.KV_BINDING.put(key, newCount.toString());
-
-  if (newCount >= settings.autoMuteAfterViolations) {
-    await muteUser(chatId, userId, settings.autoMuteDurationMinutes, env);
-    await env.KV_BINDING.put(key, "0");
-    await sendText(
-      chatId,
-      `🔇 User ${userId} auto-muted for ${settings.autoMuteDurationMinutes} minutes due to repeated link posting.`,
-      env
-    );
+  await env.BOT_CONFIG.put(key, newCount.toString());
+  if (newCount >= 3) {
+    await muteUser(chatId, userId, 30, env);
+    await env.BOT_CONFIG.put(key, "0");
+    await sendText(chatId, `User ${userId} auto-muted for 30 minutes due to repeated link posting.`, env);
   }
-}
-
-/* COMMANDS */
-
-async function handleCommand(message: TelegramMessage, env: Env): Promise<void> {
-  const chat = message.chat;
-  const chatId = chat.id.toString();
-  const from = message.from;
-  const text = message.text || "";
-
-  const [rawCmd, ...args] = text.split(" ");
-  const cmd = rawCmd.split("@")[0];
-
-  if (!from) return;
-
-  if (chat.type === "private") {
-    if (cmd === "/groups") {
-      await showGroups(chatId, env);
-      return;
-    }
-    if (cmd === "/start" || cmd === "/help") {
-      await sendText(
-        chatId,
-        "Use /groups here to see groups.\nInside a group:\n- reply + /mute 10m\n- reply + /unmute\n- reply + /delafter 10s\n- /settings and /set",
-        env
-      );
-      return;
-    }
-    return;
-  }
-
-  if (chat.type !== "group" && chat.type !== "supergroup") return;
-
-  const isFromAdmin = await isAdmin(chatId, from.id, env);
-  const settings = await getSettings(chatId, env);
-
-  switch (cmd) {
-    case "/mute": {
-      if (!isFromAdmin) return;
-      const reply = message.reply_to_message;
-      if (!reply || !reply.from) {
-        await sendText(chatId, "Reply to a user's message with /mute 10m", env);
-        return;
-      }
-      const targetUser = reply.from;
-      const seconds = parseDurationSeconds(args[0], settings.manualMuteDefaultMinutes * 60);
-      const minutes = Math.max(1, Math.round(seconds / 60));
-      await muteUser(chatId, targetUser.id, minutes, env);
-      await sendText(
-        chatId,
-        `🔇 Muted ${displayName(targetUser)} for ${args[0] || `${minutes}m`}.`,
-        env
-      );
-      break;
-    }
-
-    case "/unmute": {
-      if (!isFromAdmin) return;
-      const reply = message.reply_to_message;
-      if (!reply || !reply.from) {
-        await sendText(chatId, "Reply to a user's message with /unmute", env);
-        return;
-      }
-      const targetUser = reply.from;
-      await unmuteUser(chatId, targetUser.id, env);
-      await sendText(chatId, `🔊 Unmuted ${displayName(targetUser)}.`, env);
-      break;
-    }
-
-    case "/delafter": {
-      if (!isFromAdmin) return;
-      const reply = message.reply_to_message;
-      if (!reply) {
-        await sendText(chatId, "Reply to a message with /delafter 10s or /delafter 10m", env);
-        return;
-      }
-      const targetMessageId = reply.message_id;
-      const seconds = parseDurationSeconds(args[0], 10);
-      const now = Math.floor(Date.now() / 1000);
-      const deleteAt = now + seconds;
-      const key = `del:${chatId}:${targetMessageId}`;
-      await env.KV_BINDING.put(key, deleteAt.toString());
-      await sendText(chatId, `🕒 Will delete that message in ${args[0] || `${seconds}s`}.`, env);
-      break;
-    }
-
-    case "/settings": {
-      if (!isFromAdmin) return;
-      const msg =
-        "Current settings:\n" +
-        `- Auto-mute after violations: ${settings.autoMuteAfterViolations}\n` +
-        `- Auto-mute duration: ${settings.autoMuteDurationMinutes} minutes\n` +
-        `- Manual /mute default: ${settings.manualMuteDefaultMinutes} minutes\n\n` +
-        "Change with:\n" +
-        "/set automute_violations 3\n" +
-        "/set automute_duration 30m\n" +
-        "/set mute_default 1h";
-      await sendText(chatId, msg, env);
-      break;
-    }
-
-    case "/set": {
-      if (!isFromAdmin) return;
-      const key = args[0];
-      const value = args[1];
-      if (!key || !value) {
-        await sendText(
-          chatId,
-          "Usage:\n/set automute_violations 3\n/set automute_duration 30m\n/set mute_default 1h",
-          env
-        );
-        return;
-      }
-
-      if (key === "automute_violations") {
-        const num = parseInt(value, 10);
-        if (!num || num < 1) {
-          await sendText(chatId, "automute_violations must be a number >= 1", env);
-          return;
-        }
-        settings.autoMuteAfterViolations = num;
-      } else if (key === "automute_duration") {
-        const seconds = parseDurationSeconds(value, settings.autoMuteDurationMinutes * 60);
-        settings.autoMuteDurationMinutes = Math.max(1, Math.round(seconds / 60));
-      } else if (key === "mute_default") {
-        const seconds = parseDurationSeconds(value, settings.manualMuteDefaultMinutes * 60);
-        settings.manualMuteDefaultMinutes = Math.max(1, Math.round(seconds / 60));
-      } else {
-        await sendText(chatId, "Unknown setting key.", env);
-        return;
-      }
-
-      await saveSettings(chatId, settings, env);
-      await sendText(chatId, "✅ Settings updated.", env);
-      break;
-    }
-
-    case "/help":
-    case "/start": {
-      await sendText(
-        chatId,
-        "Commands (admins):\n" +
-          "- reply + /mute 10m\n" +
-          "- reply + /unmute\n" +
-          "- reply + /delafter 10s\n" +
-          "- /settings\n" +
-          "- /set automute_violations 3\n" +
-          "- /set automute_duration 30m\n" +
-          "- /set mute_default 1h",
-        env
-      );
-      break;
-    }
-
-    default:
-      break;
-  }
-}
-
-/* DURATION, MUTE, UNMUTE, ADMIN, TG HELPERS */
-
-function parseDurationSeconds(arg: string | undefined, defaultSeconds: number): number {
-  if (!arg) return defaultSeconds;
-  const match = arg.match(/^(\d+)(s|m|h|d)$/i);
-  if (!match) return defaultSeconds;
-  const value = parseInt(match[1], 10);
-  const unit = match[2].toLowerCase();
-  if (unit === "s") return value;
-  if (unit === "m") return value * 60;
-  if (unit === "h") return value * 60 * 60;
-  if (unit === "d") return value * 60 * 60 * 24;
-  return defaultSeconds;
 }
 
 async function muteUser(chatId: string, userId: number, minutes: number, env: Env): Promise<void> {
@@ -429,19 +274,19 @@ async function unmuteUser(chatId: string, userId: number, env: Env): Promise<voi
 
 async function isAdmin(chatId: string, userId: number, env: Env): Promise<boolean> {
   try {
-    const data = await tgCall("getChatMember", env, {
+    const res = await tgCall("getChatMember", env, {
       chat_id: chatId,
       user_id: userId
     });
-    if (!data || data.ok === false) return false;
-    const status = data.result.status;
+    if (!res || !res.ok) return false;
+    const status = res.result.status;
     return status === "creator" || status === "administrator";
   } catch {
     return false;
   }
 }
 
-async function sendText(chatId: string | number, text: string, env: Env): Promise<void> {
+async function sendText(chatId: number | string, text: string, env: Env): Promise<void> {
   await tgCall("sendMessage", env, {
     chat_id: chatId,
     text
@@ -476,35 +321,123 @@ async function tgCall(method: string, env: Env, body: Record<string, unknown>): 
 
 function displayName(user: TelegramUser): string {
   if (user.username) return `@${user.username}`;
-  const full = `${user.first_name || ""} ${user.last_name || ""}`.trim();
-  return full || `${user.id}`;
+  const fullName = `${user.first_name || ""} ${user.last_name || ""}`.trim();
+  if (fullName) return fullName;
+  return `${user.id}`;
 }
 
-/* SCHEDULED DELETE PROCESSOR */
+function parseDurationToMinutes(arg: string | undefined): number {
+  if (!arg) return 24 * 60;
+  const match = arg.match(/^(\d+)(s|m|h|d)$/i);
+  if (!match) return 24 * 60;
+  const value = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  if (unit === "s") return Math.max(1, Math.floor(value / 60));
+  if (unit === "m") return value;
+  if (unit === "h") return value * 60;
+  if (unit === "d") return value * 60 * 24;
+  return 24 * 60;
+}
 
-async function processScheduledDeletes(env: Env): Promise<void> {
-  const now = Math.floor(Date.now() / 1000);
-  const list = await env.KV_BINDING.list({ prefix: "del:", limit: 100 });
+function parseDurationToSeconds(arg: string | undefined): number {
+  if (!arg) return 10;
+  const match = arg.match(/^(\d+)(s|m|h|d)$/i);
+  if (!match) return 10;
+  const value = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  if (unit === "s") return value;
+  if (unit === "m") return value * 60;
+  if (unit === "h") return value * 60 * 60;
+  if (unit === "d") return value * 60 * 60 * 24;
+  return 10;
+}
 
-  for (const key of list.keys) {
-    const value = await env.KV_BINDING.get(key.name);
-    if (!value) {
-      await env.KV_BINDING.delete(key.name);
-      continue;
-    }
-    const deleteAt = parseInt(value, 10) || 0;
-    if (deleteAt > now) continue;
+function formatDuration(minutes: number): string {
+  if (minutes < 60) return `${minutes}m`;
+  const hours = minutes / 60;
+  if (hours < 24) return `${hours}h`;
+  const days = hours / 24;
+  return `${days}d`;
+}
 
-    const parts = key.name.split(":");
-    if (parts.length < 3) {
-      await env.KV_BINDING.delete(key.name);
-      continue;
-    }
-    const chatId = parts[1];
-    const messageId = parseInt(parts[2], 10);
-    if (!Number.isNaN(messageId)) {
-      await deleteMessage(chatId, messageId, env);
-    }
-    await env.KV_BINDING.delete(key.name);
+function formatDurationSeconds(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = seconds / 60;
+  if (minutes < 60) return `${minutes}m`;
+  const hours = minutes / 60;
+  if (hours < 24) return `${hours}h`;
+  const days = hours / 24;
+  return `${days}d`;
+}
+
+async function saveGroupInfo(chat: TelegramChat, env: Env): Promise<void> {
+  const key = `group:${chat.id}`;
+  const value = JSON.stringify({
+    id: chat.id,
+    title: chat.title || "",
+    type: chat.type,
+    updatedAt: Date.now()
+  });
+  await env.BOT_CONFIG.put(key, value);
+}
+
+async function saveUsername(chatId: string, username: string, userId: number, env: Env): Promise<void> {
+  const key = `user:${chatId}:${username.toLowerCase()}`;
+  await env.BOT_CONFIG.put(key, userId.toString());
+}
+
+async function resolveTargetUser(message: TelegramMessage, args: string[], env: Env): Promise<TelegramUser | null> {
+  const chatId = message.chat.id.toString();
+  if (message.reply_to_message && message.reply_to_message.from) {
+    return message.reply_to_message.from;
   }
+  const maybeUser = args.find((a) => a.startsWith("@"));
+  if (!maybeUser) return null;
+  const username = maybeUser.replace("@", "").toLowerCase();
+  const key = `user:${chatId}:${username}`;
+  const userIdStr = await env.BOT_CONFIG.get(key);
+  if (!userIdStr) return null;
+  const userId = parseInt(userIdStr, 10);
+  return { id: userId, username };
+}
+
+async function listGroups(chatId: number, env: Env): Promise<void> {
+  let cursor: string | undefined = undefined;
+  const lines: string[] = [];
+
+  do {
+    const res = (await env.BOT_CONFIG.list({ prefix: "group:", cursor })) as unknown as KVListResult;
+    for (const key of res.keys) {
+      const value = await env.BOT_CONFIG.get(key.name);
+      if (!value) continue;
+      const g = JSON.parse(value) as { id: number; title: string; type: string };
+      lines.push(`${g.title || "(no title)"} [${g.id}]`);
+    }
+    cursor = res.cursor;
+  } while (cursor);
+
+  if (lines.length === 0) {
+    await sendText(chatId, "No groups stored yet. Add me to some groups as admin and let people talk.", env);
+  } else {
+    await sendText(chatId, "Groups I am in:\n\n" + lines.join("\n"), env);
+  }
+}
+
+async function processDeleteTasks(env: Env): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  let cursor: string | undefined = undefined;
+
+  do {
+    const res = (await env.BOT_CONFIG.list({ prefix: "delete_task:", cursor })) as unknown as KVListResult;
+    for (const key of res.keys) {
+      const value = await env.BOT_CONFIG.get(key.name);
+      if (!value) continue;
+      const task = JSON.parse(value) as { chatId: string; messageId: number; deleteAt: number };
+      if (task.deleteAt <= now) {
+        await deleteMessage(task.chatId, task.messageId, env);
+        await env.BOT_CONFIG.delete(key.name);
+      }
+    }
+    cursor = res.cursor;
+  } while (cursor);
 }
