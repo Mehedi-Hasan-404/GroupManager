@@ -4,7 +4,6 @@ compatibility_date = "2025-12-06"
 
 [vars]
 TELEGRAM_BOT_TOKEN = "8580301156:AAFx2ho_dhgNBVCzSZjNIaDQes-jPOnH3RQ"
-
 OWNER_USER_IDS = "5115267657"
 
 [[kv_namespaces]]
