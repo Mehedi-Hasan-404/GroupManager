@@ -10,7 +10,7 @@ binding = "BOT_CONFIG"
 id = "1b765d912d3542479132bd4b42465e3f"
 
 [triggers]
-crons = [*/1 * * * *]
+crons = ["*/1 * * * *"]
 
 [observability]
 enabled = true
