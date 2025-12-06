@@ -82,7 +82,7 @@ function isOwner(userId: number | undefined, env: Env): boolean {
 function defaultSettings(): GroupSettings {
   return {
     antilink: true,
-    antiforward: false,
+    antiforward: true,
     auto_mute: true,
     auto_mute_minutes: 30,
     max_violations: 3,
