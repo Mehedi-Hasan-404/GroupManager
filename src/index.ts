@@ -5,7 +5,9 @@ export interface Env {
   BOT_CONFIG: KVNamespace;
 }
 
-interface MessageEntity {
+/* ================= TYPES ================= */
+
+interface Entity {
   type: string;
   url?: string;
 }
@@ -27,32 +29,47 @@ interface Message {
   message_id: number;
   text?: string;
   caption?: string;
-  entities?: MessageEntity[];
-  caption_entities?: MessageEntity[];
+  entities?: Entity[];
+  caption_entities?: Entity[];
   from?: User;
   chat: Chat;
   reply_to_message?: Message;
 }
 
 interface Update {
-  update_id: number;
   message?: Message;
 }
+
+interface GroupSettings {
+  deleteLinks: boolean;
+  autoMute: boolean;
+  maxViolations: number;
+  muteMinutes: number;
+  whitelist: string[];
+}
+
+/* ================= DEFAULT SETTINGS ================= */
+
+const DEFAULT_SETTINGS: GroupSettings = {
+  deleteLinks: true,
+  autoMute: true,
+  maxViolations: 3,
+  muteMinutes: 30,
+  whitelist: []
+};
 
 /* ================= WORKER ================= */
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext) {
     if (req.method !== "POST") return new Response("OK");
-
     const update = await req.json<Update>();
     if (!update.message) return new Response("OK");
-
     ctx.waitUntil(handleMessage(update.message, env));
     return new Response("OK");
   },
 
-  async scheduled(_e: ScheduledEvent, env: Env) {
+  async scheduled(_: ScheduledEvent, env: Env) {
     await processDeleteQueue(env);
   }
 };
@@ -60,26 +77,29 @@ export default {
 /* ================= MESSAGE HANDLER ================= */
 
 async function handleMessage(msg: Message, env: Env) {
-  const chatId = String(msg.chat.id);
-  const user = msg.from;
-  if (!user) return;
-
+  if (!msg.from) return;
   if (msg.chat.type === "private") return;
 
-  await saveGroup(msg.chat, env);
-
+  const chatId = String(msg.chat.id);
   const text = msg.text || msg.caption || "";
+
+  await saveGroup(msg.chat, env);
 
   if (text.startsWith("/")) {
     await handleCommand(msg, env);
     return;
   }
 
-  const whitelist = await getWhitelist(chatId, env);
+  const settings = await getSettings(chatId, env);
 
-  if (hasAnyLink(msg, whitelist)) {
+  if (!settings.deleteLinks) return;
+
+  if (hasAnyLink(msg, settings.whitelist)) {
     await deleteMessage(chatId, msg.message_id, env);
-    await registerViolation(chatId, user.id, env);
+
+    if (settings.autoMute) {
+      await registerViolation(chatId, msg.from.id, settings, env);
+    }
   }
 }
 
@@ -88,7 +108,7 @@ async function handleMessage(msg: Message, env: Env) {
 function hasAnyLink(msg: Message, whitelist: string[]): boolean {
   const text = (msg.text || msg.caption || "").toLowerCase();
 
-  if (isWhitelisted(text, whitelist)) return false;
+  if (whitelist.some(w => text.includes(w.toLowerCase()))) return false;
 
   const regex =
     /((https?:\/\/|www\.)\S+|\b[a-z0-9.-]+\.[a-z]{2,}\S*)/i;
@@ -103,30 +123,31 @@ function hasAnyLink(msg: Message, whitelist: string[]): boolean {
   return entities.some(e => e.type === "url" || e.type === "text_link");
 }
 
-function isWhitelisted(text: string, whitelist: string[]) {
-  return whitelist.some(domain => text.includes(domain.toLowerCase()));
+/* ================= SETTINGS ================= */
+
+async function getSettings(chatId: string, env: Env): Promise<GroupSettings> {
+  const raw = await env.BOT_CONFIG.get(`settings:${chatId}`);
+  return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : DEFAULT_SETTINGS;
 }
 
-/* ================= WHITELIST ================= */
-
-async function getWhitelist(chatId: string, env: Env): Promise<string[]> {
-  const raw = await env.BOT_CONFIG.get(`whitelist:${chatId}`);
-  return raw ? JSON.parse(raw) : [];
+async function saveSettings(chatId: string, s: GroupSettings, env: Env) {
+  await env.BOT_CONFIG.put(`settings:${chatId}`, JSON.stringify(s));
 }
 
-async function saveWhitelist(chatId: string, list: string[], env: Env) {
-  await env.BOT_CONFIG.put(`whitelist:${chatId}`, JSON.stringify(list));
-}
+/* ================= VIOLATIONS ================= */
 
-/* ================= VIOLATIONS / AUTO MUTE ================= */
-
-async function registerViolation(chatId: string, userId: number, env: Env) {
+async function registerViolation(
+  chatId: string,
+  userId: number,
+  s: GroupSettings,
+  env: Env
+) {
   const key = `vio:${chatId}:${userId}`;
-  const count = Number(await env.BOT_CONFIG.get(key)) || 0;
-  const newCount = count + 1;
+  const n = Number(await env.BOT_CONFIG.get(key)) || 0;
+  const newCount = n + 1;
 
-  if (newCount >= 3) {
-    await muteUser(chatId, userId, 30, env);
+  if (newCount >= s.maxViolations) {
+    await muteUser(chatId, userId, s.muteMinutes, env);
     await env.BOT_CONFIG.delete(key);
   } else {
     await env.BOT_CONFIG.put(key, String(newCount));
@@ -140,38 +161,91 @@ async function handleCommand(msg: Message, env: Env) {
   const text = msg.text || "";
   const [cmd, a1, a2] = text.split(" ");
 
-  if (cmd === "/del" && msg.reply_to_message) {
-    const sec = parseTime(a1 || "10s");
-    await scheduleDelete(chatId, msg.reply_to_message.message_id, sec, env);
+  const settings = await getSettings(chatId, env);
+
+  /* ---- SETTINGS ---- */
+
+  if (cmd === "/settings") {
+    await sendMessage(
+      chatId,
+      formatSettings(settings),
+      env
+    );
+    return;
   }
+
+  if (cmd === "/set") {
+    if (a1 === "links") settings.deleteLinks = a2 === "on";
+    if (a1 === "automute") settings.autoMute = a2 === "on";
+    if (a1 === "violations") settings.maxViolations = Number(a2);
+    if (a1 === "mutetime") settings.muteMinutes = Number(a2);
+
+    await saveSettings(chatId, settings, env);
+    await sendMessage(chatId, "✅ Settings updated", env);
+    return;
+  }
+
+  /* ---- WHITELIST ---- */
+
+  if (cmd === "/whitelist") {
+    if (a1 === "add" && a2) settings.whitelist.push(a2);
+    if (a1 === "remove") settings.whitelist =
+      settings.whitelist.filter(d => d !== a2);
+
+    await saveSettings(chatId, settings, env);
+    await sendMessage(
+      chatId,
+      "Whitelist:\n" + settings.whitelist.join("\n"),
+      env
+    );
+    return;
+  }
+
+  /* ---- MODERATION ---- */
 
   if (cmd === "/mute" && msg.reply_to_message?.from) {
     await muteUser(
       chatId,
       msg.reply_to_message.from.id,
-      parseTime(a1 || "30m") / 60,
+      parseTime(a1) / 60,
       env
     );
+    return;
   }
 
   if (cmd === "/unmute" && msg.reply_to_message?.from) {
     await unmuteUser(chatId, msg.reply_to_message.from.id, env);
+    return;
   }
 
-  if (cmd === "/whitelist") {
-    let list = await getWhitelist(chatId, env);
-
-    if (a1 === "add" && a2) list.push(a2);
-    if (a1 === "remove") list = list.filter(d => d !== a2);
-
-    await saveWhitelist(chatId, list, env);
-    await sendMessage(chatId, "Whitelist:\n" + list.join("\n"), env);
+  if (cmd === "/del" && msg.reply_to_message) {
+    await scheduleDelete(
+      chatId,
+      msg.reply_to_message.message_id,
+      parseTime(a1),
+      env
+    );
   }
 }
 
-/* ================= TIME ================= */
+/* ================= HELPERS ================= */
 
-function parseTime(t: string): number {
+function formatSettings(s: GroupSettings): string {
+  return (
+    "⚙️ Group Settings:\n\n" +
+    `Delete links: ${s.deleteLinks ? "ON" : "OFF"}\n` +
+    `Auto mute: ${s.autoMute ? "ON" : "OFF"}\n` +
+    `Max violations: ${s.maxViolations}\n` +
+    `Mute time: ${s.muteMinutes} min\n\n` +
+    "Commands:\n" +
+    "/set links on|off\n" +
+    "/set automute on|off\n" +
+    "/set violations <number>\n" +
+    "/set mutetime <minutes>"
+  );
+}
+
+function parseTime(t = "10s"): number {
   const m = t.match(/^(\d+)(s|m|h|d)$/i);
   if (!m) return 60;
   const n = +m[1];
@@ -186,11 +260,7 @@ function parseTime(t: string): number {
 
 /* ================= TELEGRAM API ================= */
 
-async function tg(
-  method: string,
-  body: Record<string, any>,
-  env: Env
-) {
+async function tg(method: string, body: any, env: Env) {
   await fetch(`${TG_API}/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -198,12 +268,12 @@ async function tg(
   });
 }
 
-async function deleteMessage(chatId: string, msgId: number, env: Env) {
-  await tg("deleteMessage", { chat_id: chatId, message_id: msgId }, env);
-}
-
 async function sendMessage(chatId: string, text: string, env: Env) {
   await tg("sendMessage", { chat_id: chatId, text }, env);
+}
+
+async function deleteMessage(chatId: string, id: number, env: Env) {
+  await tg("deleteMessage", { chat_id: chatId, message_id: id }, env);
 }
 
 async function muteUser(chatId: string, userId: number, minutes: number, env: Env) {
@@ -235,12 +305,12 @@ async function unmuteUser(chatId: string, userId: number, env: Env) {
 
 async function scheduleDelete(
   chatId: string,
-  messageId: number,
+  msgId: number,
   sec: number,
   env: Env
 ) {
   await env.BOT_CONFIG.put(
-    `del:${chatId}:${messageId}`,
+    `del:${chatId}:${msgId}`,
     String(Date.now() + sec * 1000)
   );
 }
@@ -248,7 +318,6 @@ async function scheduleDelete(
 async function processDeleteQueue(env: Env) {
   const now = Date.now();
   const list = await env.BOT_CONFIG.list({ prefix: "del:" });
-
   for (const k of list.keys) {
     const t = Number(await env.BOT_CONFIG.get(k.name));
     if (t <= now) {
