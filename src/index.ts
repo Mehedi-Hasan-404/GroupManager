@@ -1,12 +1,14 @@
+// Telegram Group Manager bot for Cloudflare Workers
+
 const TG_API_BASE = "https://api.telegram.org";
 
 export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   BOT_CONFIG: KVNamespace;
-  OWNER_USER_IDS?: string; // comma-separated owner ids, e.g. "5115267657,123456789"
+  OWNER_USER_IDS?: string;
 }
 
-/* ========== TELEGRAM TYPES (simplified) ========== */
+// ====== Types ======
 
 interface TelegramUser {
   id: number;
@@ -18,82 +20,61 @@ interface TelegramUser {
 
 interface TelegramChat {
   id: number;
-  type: "private" | "group" | "supergroup" | "channel" | string;
+  type: string; // "private" | "group" | "supergroup" | "channel" | ...
   title?: string;
+  username?: string;
 }
 
 interface TelegramMessage {
   message_id: number;
   from?: TelegramUser;
-  sender_chat?: TelegramChat;
+  sender_chat?: TelegramChat; // for anonymous admins etc.
   chat: TelegramChat;
   text?: string;
   caption?: string;
   reply_to_message?: TelegramMessage;
-
-  // forwarded fields (we treat ANY of these as "forward")
-  forward_from?: TelegramUser;
-  forward_from_chat?: TelegramChat;
-  forward_from_message_id?: number;
-  forward_sender_name?: string;
-  forward_date?: number;
-  is_automatic_forward?: boolean;
-  // newer API can have forward_origin, story, etc.; we’ll treat any forward_* as forward.
-}
-
-interface TelegramChatMemberUpdate {
-  chat: TelegramChat;
-  new_chat_member: {
-    user: TelegramUser;
-    status: string; // "member", "administrator", "left", "kicked", etc.
-  };
+  // Forward-related – use as "any" internally
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [key: string]: any;
 }
 
 interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
-  my_chat_member?: TelegramChatMemberUpdate;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  my_chat_member?: any;
 }
 
-/* ========== GROUP SETTINGS & QUEUES ========== */
-
+// Group settings kept in KV
 interface GroupSettings {
   antilink: boolean;
   antiforward: boolean;
-  autowarn: boolean;
   maxWarns: number;
   autoMuteMinutes: number;
-  whitelist: string[];
+  whitelist: string[]; // domains in lowercase, e.g. "example.com"
 }
 
-interface GroupInfo {
+interface GroupMeta {
   id: number;
   title?: string;
-  type: string;
-  active: boolean;
-  updatedAt: number;
+  username?: string;
+  addedAt: number; // unix seconds
 }
 
-interface DelEntry {
-  chat_id: string;
-  message_ids: number[];
-  delete_at: number; // epoch seconds
+interface DeleteJob {
+  chatId: number;
+  targetMessageId: number;
+  infoMessageId?: number;
+  deleteAt: number; // unix seconds
 }
 
-/* ========== DEFAULTS ========== */
+// KV key prefixes
+const SETTINGS_PREFIX = "settings:";
+const GROUP_META_PREFIX = "groupmeta:";
+const WARNS_PREFIX = "warns:";
+const DELQUEUE_PREFIX = "delqueue:";
 
-function defaultSettings(): GroupSettings {
-  return {
-    antilink: true,
-    antiforward: true,   // anti-forward ON by default (including stories)
-    autowarn: true,
-    maxWarns: 3,
-    autoMuteMinutes: 30,
-    whitelist: []
-  };
-}
-
-/* ========== MAIN EXPORT ========== */
+// ====== Worker entrypoints ======
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -111,642 +92,742 @@ export default {
     if (!update) return new Response("No update", { status: 400 });
 
     if (update.message) {
-      ctx.waitUntil(handleMessageUpdate(update.message, env));
-    } else if (update.my_chat_member) {
+      ctx.waitUntil(handleMessage(update.message, env));
+    }
+
+    if (update.my_chat_member) {
       ctx.waitUntil(handleMyChatMember(update.my_chat_member, env));
     }
 
     return new Response("OK");
   },
 
-  async scheduled(event: any, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(handleCron(env));
+  // Cron for delayed deletes
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(processDeleteQueue(env));
   }
 };
 
-/* ========== OWNER CHECK ========== */
+// ====== Core handlers ======
 
-function isOwnerId(userId: number, env: Env): boolean {
-  const raw = env.OWNER_USER_IDS;
-  if (!raw || !raw.trim()) {
-    // If not set, no restriction (for safety in early setup)
-    return true;
-  }
-  const list = raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  return list.includes(String(userId));
-}
-
-/* ========== UPDATE HANDLERS ========== */
-
-async function handleMessageUpdate(message: TelegramMessage, env: Env): Promise<void> {
+async function handleMessage(message: TelegramMessage, env: Env): Promise<void> {
   const chat = message.chat;
 
-  // Private chat: handle separately
   if (chat.type === "private") {
     await handlePrivateMessage(message, env);
     return;
   }
 
-  // Group / supergroup only
-  if (chat.type !== "group" && chat.type !== "supergroup") {
+  if (chat.type === "group" || chat.type === "supergroup") {
+    await handleGroupMessage(message, env);
+  }
+}
+
+// When bot is added/removed from groups
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function handleMyChatMember(update: any, env: Env): Promise<void> {
+  const chat: TelegramChat = update.chat;
+  const newMember = update.new_chat_member;
+
+  if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) return;
+
+  const status: string = newMember?.status || "";
+
+  if (status === "member" || status === "administrator") {
+    await ensureGroupKnown(chat, env);
+  } else if (status === "left" || status === "kicked") {
+    await removeGroup(chat.id, env);
+  }
+}
+
+// ====== Private chat (owner control panel) ======
+
+async function handlePrivateMessage(message: TelegramMessage, env: Env): Promise<void> {
+  const chatId = message.chat.id;
+  const from = message.from;
+  const text = message.text || "";
+
+  if (!from) return;
+
+  const [rawCmd, ...args] = text.trim().split(/\s+/);
+  if (!rawCmd.startsWith("/")) {
+    await sendText(chatId, "Use /help to see commands.", env);
     return;
   }
 
-  const chatId = String(chat.id);
-  const user = message.from;
+  const cmd = rawCmd.split("@")[0];
 
-  await trackGroup(chat, env); // track / refresh group info
+  const isOwnerUser = isOwner(from.id, env);
+  if (!isOwnerUser) {
+    if (cmd === "/start" || cmd === "/help") {
+      await sendText(
+        chatId,
+        "This bot is restricted. Only the configured owner(s) can manage settings.\nYou can still use it in groups for moderation.",
+        env
+      );
+    } else {
+      await sendText(chatId, "Only the bot owner can use this command.", env);
+    }
+    return;
+  }
+
+  switch (cmd) {
+    case "/start":
+      await sendText(
+        chatId,
+        [
+          "👋 Group Manager control panel.",
+          "",
+          "Main commands (use *here* in PM):",
+          "/groups – list groups where I'm added",
+          "/status <chat_id> – show settings for a group",
+          "/set <chat_id> <key> <value> – change settings",
+          "  keys: antilink on|off, antiforward on|off, maxwarns N, automute N_minutes",
+          "/whitelist <chat_id> add|remove|list <domain>",
+          "",
+          "Use /help for full info."
+        ].join("\n"),
+        env
+      );
+      break;
+
+    case "/help":
+      await sendText(
+        chatId,
+        [
+          "Available commands:",
+          "",
+          "/groups – list groups where I'm added",
+          "/status <chat_id> – show config for that group",
+          "/set <chat_id> <key> <value>",
+          "  • antilink on|off",
+          "  • antiforward on|off",
+          "  • maxwarns <number>",
+          "  • automute <minutes>",
+          "",
+          "/whitelist <chat_id> add <domain>",
+          "/whitelist <chat_id> remove <domain>",
+          "/whitelist <chat_id> list",
+          "",
+          "Use group commands directly in groups:",
+          "  /mute 10m (reply) – mute user",
+          "  /unmute (reply) – unmute user",
+          "  /del 10s (reply) – delete that message later",
+          "  /status – show current settings for this group."
+        ].join("\n"),
+        env
+      );
+      break;
+
+    case "/groups":
+      await handleGroupsCommand(chatId, env);
+      break;
+
+    case "/status":
+      await handleStatusPM(chatId, args, env);
+      break;
+
+    case "/set":
+      await handleSetPM(chatId, args, env);
+      break;
+
+    case "/whitelist":
+      await handleWhitelistPM(chatId, args, env);
+      break;
+
+    default:
+      await sendText(chatId, "Unknown command. Use /help.", env);
+      break;
+  }
+}
+
+async function handleGroupsCommand(chatId: number, env: Env): Promise<void> {
+  const list = await env.BOT_CONFIG.list({ prefix: GROUP_META_PREFIX, limit: 1000 });
+  if (!list.keys.length) {
+    await sendText(chatId, "I don't know any groups yet.", env);
+    return;
+  }
+
+  const lines: string[] = ["Groups I know:\n"];
+  for (const key of list.keys) {
+    const metaJson = await env.BOT_CONFIG.get(key.name);
+    if (!metaJson) continue;
+    const meta = JSON.parse(metaJson) as GroupMeta;
+    const title = meta.title || "(no title)";
+    lines.push(`${title} — \`${meta.id}\``);
+  }
+
+  await sendText(chatId, lines.join("\n"), env, { parse_mode: "Markdown" });
+}
+
+async function handleStatusPM(chatId: number, args: string[], env: Env): Promise<void> {
+  const idStr = args[0];
+  if (!idStr) {
+    await sendText(chatId, "Usage: /status <chat_id>\nUse /groups to see chat IDs.", env);
+    return;
+  }
+
+  const groupId = parseInt(idStr, 10);
+  if (!groupId) {
+    await sendText(chatId, "Invalid chat_id.", env);
+    return;
+  }
+
+  const settings = await loadSettings(groupId, env);
+  await sendText(chatId, formatSettings(groupId, settings), env);
+}
+
+async function handleSetPM(chatId: number, args: string[], env: Env): Promise<void> {
+  const [idStr, key, value] = args;
+  if (!idStr || !key || !value) {
+    await sendText(
+      chatId,
+      "Usage: /set <chat_id> <key> <value>\nExample: /set -100123456789 antilink on",
+      env
+    );
+    return;
+  }
+
+  const groupId = parseInt(idStr, 10);
+  if (!groupId) {
+    await sendText(chatId, "Invalid chat_id.", env);
+    return;
+  }
+
+  const settings = await loadSettings(groupId, env);
+
+  switch (key.toLowerCase()) {
+    case "antilink":
+      settings.antilink = value.toLowerCase() === "on";
+      break;
+    case "antiforward":
+      settings.antiforward = value.toLowerCase() === "on";
+      break;
+    case "maxwarns": {
+      const n = parseInt(value, 10);
+      if (!n || n < 1) {
+        await sendText(chatId, "maxwarns must be a positive number.", env);
+        return;
+      }
+      settings.maxWarns = n;
+      break;
+    }
+    case "automute": {
+      const n = parseInt(value, 10);
+      if (!n || n < 1) {
+        await sendText(chatId, "automute must be minutes > 0.", env);
+        return;
+      }
+      settings.autoMuteMinutes = n;
+      break;
+    }
+    default:
+      await sendText(
+        chatId,
+        "Unknown key. Supported keys: antilink, antiforward, maxwarns, automute",
+        env
+      );
+      return;
+  }
+
+  await saveSettings(groupId, settings, env);
+  await sendText(chatId, "Saved:\n" + formatSettings(groupId, settings), env);
+}
+
+async function handleWhitelistPM(chatId: number, args: string[], env: Env): Promise<void> {
+  const [idStr, action, domainArg] = args;
+  if (!idStr || !action) {
+    await sendText(
+      chatId,
+      "Usage: /whitelist <chat_id> add|remove|list <domain>",
+      env
+    );
+    return;
+  }
+
+  const groupId = parseInt(idStr, 10);
+  if (!groupId) {
+    await sendText(chatId, "Invalid chat_id.", env);
+    return;
+  }
+
+  const settings = await loadSettings(groupId, env);
+
+  switch (action.toLowerCase()) {
+    case "list": {
+      if (!settings.whitelist.length) {
+        await sendText(chatId, "Whitelist is empty for this group.", env);
+      } else {
+        await sendText(
+          chatId,
+          "Whitelisted domains:\n" + settings.whitelist.join("\n"),
+          env
+        );
+      }
+      break;
+    }
+    case "add": {
+      if (!domainArg) {
+        await sendText(chatId, "Usage: /whitelist <chat_id> add <domain>", env);
+        return;
+      }
+      const d = normalizeDomain(domainArg);
+      if (!d) {
+        await sendText(chatId, "Invalid domain.", env);
+        return;
+      }
+      if (!settings.whitelist.includes(d)) {
+        settings.whitelist.push(d);
+        await saveSettings(groupId, settings, env);
+      }
+      await sendText(chatId, `Added to whitelist: ${d}`, env);
+      break;
+    }
+    case "remove": {
+      if (!domainArg) {
+        await sendText(chatId, "Usage: /whitelist <chat_id> remove <domain>", env);
+        return;
+      }
+      const d = normalizeDomain(domainArg);
+      if (!d) {
+        await sendText(chatId, "Invalid domain.", env);
+        return;
+      }
+      settings.whitelist = settings.whitelist.filter((x) => x !== d);
+      await saveSettings(groupId, settings, env);
+      await sendText(chatId, `Removed from whitelist: ${d}`, env);
+      break;
+    }
+    default:
+      await sendText(
+        chatId,
+        "Unknown action. Use add, remove or list.",
+        env
+      );
+      break;
+  }
+}
+
+// ====== Group messages ======
+
+async function handleGroupMessage(message: TelegramMessage, env: Env): Promise<void> {
+  const chat = message.chat;
+  const chatId = chat.id;
+  const text = message.text || message.caption || "";
+
+  await ensureGroupKnown(chat, env);
+  const settings = await loadSettings(chatId, env);
+
+  // 1) Commands
+  if (text.startsWith("/")) {
+    await handleGroupCommand(message, settings, env);
+    return;
+  }
+
+  // 2) Moderation for normal messages
+  await applyModerationRules(message, settings, env);
+}
+
+async function handleGroupCommand(message: TelegramMessage, settings: GroupSettings, env: Env): Promise<void> {
+  const chat = message.chat;
+  const chatId = chat.id;
+  const text = message.text || "";
+  const from = message.from;
+
+  const [rawCmd, ...args] = text.trim().split(/\s+/);
+  const cmd = rawCmd.split("@")[0];
+
+  // /status works for everyone to see config
+  if (cmd === "/status") {
+    await sendText(chatId, formatSettings(chatId, settings), env);
+    return;
+  }
+
+  // Other commands require "admin-like" sender (normal admin or anonymous admin)
+  const isAdminLike = await isAdminLikeSender(message, env);
+  if (!isAdminLike) return;
+
+  switch (cmd) {
+    case "/mute": {
+      const reply = message.reply_to_message;
+      if (!reply || !reply.from) {
+        await sendText(chatId, "Reply to a user's message with /mute <time>, e.g. /mute 10m", env);
+        return;
+      }
+      const target = reply.from;
+      const durationMinutes = parseDuration(args[0]); // default 24h
+      await muteUser(chatId, target.id, durationMinutes, env);
+      await sendText(
+        chatId,
+        `🔇 Muted ${displayName(target)} for ${args[0] || "24h"}.`,
+        env
+      );
+      break;
+    }
+
+    case "/unmute": {
+      const reply = message.reply_to_message;
+      if (!reply || !reply.from) {
+        await sendText(chatId, "Reply to a user's message with /unmute", env);
+        return;
+      }
+      const target = reply.from;
+      await unmuteUser(chatId, target.id, env);
+      await sendText(
+        chatId,
+        `🔊 Unmuted ${displayName(target)}.`,
+        env
+      );
+      break;
+    }
+
+    case "/del": {
+      const reply = message.reply_to_message;
+      if (!reply) {
+        await sendText(chatId, "Reply to a message with /del <time>, e.g. /del 10s or /del 10m", env);
+        return;
+      }
+      const seconds = parseDurationSeconds(args[0]); // default 60s
+      const now = Math.floor(Date.now() / 1000);
+      const deleteAt = now + seconds;
+
+      const info = await sendText(
+        chatId,
+        `🗑 This message will be deleted in ${args[0] || "60s"}.`,
+        env
+      );
+
+      const job: DeleteJob = {
+        chatId,
+        targetMessageId: reply.message_id,
+        infoMessageId: info?.message_id,
+        deleteAt
+      };
+
+      const key = `${DELQUEUE_PREFIX}${chatId}:${reply.message_id}`;
+      await env.BOT_CONFIG.put(key, JSON.stringify(job));
+
+      // also schedule deletion of the /del command message itself
+      const cmdJob: DeleteJob = {
+        chatId,
+        targetMessageId: message.message_id,
+        deleteAt
+      };
+      const key2 = `${DELQUEUE_PREFIX}${chatId}:${message.message_id}`;
+      await env.BOT_CONFIG.put(key2, JSON.stringify(cmdJob));
+
+      break;
+    }
+
+    default:
+      // ignore others
+      break;
+  }
+}
+
+// Apply anti-link & anti-forward + warnings / auto-mute
+async function applyModerationRules(message: TelegramMessage, settings: GroupSettings, env: Env): Promise<void> {
+  const chatId = message.chat.id;
+  const from = message.from;
+  const senderChat = message.sender_chat;
+
+  // Don't moderate messages from bots or from the group itself (anonymous admins)
+  if (from?.is_bot) return;
+  if (senderChat && senderChat.id === chatId) return;
+
+  const userId = from?.id;
+  if (!userId) return;
 
   const text = message.text || message.caption || "";
 
-  // Commands first
-  if (text.startsWith("/")) {
-    await handleCommand(message, env, /*fromPrivate*/ false);
-    return;
+  // If user is admin, skip moderation
+  const isAdminUser = await isAdmin(chatId, userId, env);
+  if (isAdminUser) return;
+
+  let violated = false;
+  let reason = "";
+
+  if (settings.antilink && hasBlockedLink(text, settings)) {
+    violated = true;
+    reason = "posting links";
   }
 
-  // no user or from bot -> ignore for moderation
-  if (!user || user.is_bot) return;
-
-  const settings = await getGroupSettings(chatId, env);
-
-  // Anti-link
-  if (settings.antilink && containsProhibitedLink(text, settings.whitelist)) {
-    await deleteMessage(chatId, message.message_id, env);
-    await handleRuleViolation(chatId, user.id, env, settings, "link");
-    return;
+  if (!violated && settings.antiforward && isForwarded(message)) {
+    violated = true;
+    reason = "forwarding messages";
   }
 
-  // Anti-forward (including story forwards)
-  if (settings.antiforward && isForwarded(message)) {
-    await deleteMessage(chatId, message.message_id, env);
-    await handleRuleViolation(chatId, user.id, env, settings, "forward");
-    return;
-  }
+  if (!violated) return;
+
+  // Delete the message
+  await deleteMessage(chatId, message.message_id, env);
+  await addWarning(chatId, userId, reason, settings, env);
 }
 
-async function handlePrivateMessage(message: TelegramMessage, env: Env): Promise<void> {
-  const chatId = String(message.chat.id);
-  const user = message.from;
-  const text = message.text || "";
+// ====== Moderation helpers (warnings, mutes, detection) ======
 
-  if (!user) return;
+async function addWarning(
+  chatId: number,
+  userId: number,
+  reason: string,
+  settings: GroupSettings,
+  env: Env
+): Promise<void> {
+  const warnKey = `${WARNS_PREFIX}${chatId}:${userId}`;
+  const curStr = (await env.BOT_CONFIG.get(warnKey)) || "0";
+  const current = parseInt(curStr, 10) || 0;
+  const next = current + 1;
+  await env.BOT_CONFIG.put(warnKey, String(next));
 
-  if (text.startsWith("/")) {
-    await handleCommand(message, env, /*fromPrivate*/ true);
-    return;
-  }
+  const msg = `⚠️ Warning ${next}/${settings.maxWarns} for user ${userId} (${reason}).`;
+  await sendText(chatId, msg, env);
 
-  // Non-command in PM
-  if (!isOwnerId(user.id, env)) {
+  if (next >= settings.maxWarns) {
+    await env.BOT_CONFIG.put(warnKey, "0");
+    await muteUser(chatId, userId, settings.autoMuteMinutes, env);
     await sendText(
       chatId,
-      "This bot is restricted. Only the configured owner(s) can manage settings.\nYou can still use it in groups for automatic moderation.",
+      `🔇 User ${userId} auto-muted for ${settings.autoMuteMinutes} minutes due to repeated violations.`,
       env
     );
-    return;
   }
-
-  await sendText(
-    chatId,
-    "Send /help to see how to list groups and change their settings.",
-    env
-  );
 }
 
-async function handleMyChatMember(update: TelegramChatMemberUpdate, env: Env): Promise<void> {
-  const chat = update.chat;
-  if (chat.type !== "group" && chat.type !== "supergroup") return;
+function hasBlockedLink(text: string | undefined, settings: GroupSettings): boolean {
+  if (!text) return false;
 
-  const status = update.new_chat_member.status;
-  const key = `group:${chat.id}`;
-  const now = Date.now();
+  // Find domains in text (with or without http/https/www)
+  const regex = /\b((?:https?:\/\/)?(?:www\.)?((?:[a-z0-9-]+\.)+[a-z]{2,}))/gi;
+  let match: RegExpExecArray | null;
+  let found = false;
 
-  let info: GroupInfo = {
-    id: chat.id,
-    title: chat.title,
-    type: chat.type,
-    active: true,
-    updatedAt: now
-  };
-
-  const existing = await env.BOT_CONFIG.get(key);
-  if (existing) {
-    try {
-      const parsed = JSON.parse(existing) as GroupInfo;
-      info = { ...parsed, title: chat.title || parsed.title, updatedAt: now };
-    } catch {
-      // ignore
+  while ((match = regex.exec(text)) !== null) {
+    found = true;
+    const domain = (match[2] || "").toLowerCase();
+    if (!domain) continue;
+    if (!settings.whitelist.includes(domain)) {
+      return true; // domain not whitelisted -> blocked
     }
   }
 
-  if (status === "left" || status === "kicked") {
-    info.active = false;
-  } else {
-    info.active = true;
+  // Also treat t.me or telegram.me without protocol
+  const teleRe = /\b(t\.me|telegram\.me)\/\S+/i;
+  if (teleRe.test(text)) {
+    const domain = "t.me";
+    if (!settings.whitelist.includes(domain)) return true;
   }
 
-  await env.BOT_CONFIG.put(key, JSON.stringify(info));
-}
-
-/* ========== GROUP SETTINGS STORAGE ========== */
-
-async function getGroupSettings(chatId: string, env: Env): Promise<GroupSettings> {
-  const key = `settings:${chatId}`;
-  const raw = await env.BOT_CONFIG.get(key);
-  if (!raw) {
-    const def = defaultSettings();
-    await env.BOT_CONFIG.put(key, JSON.stringify(def));
-    return def;
-  }
-  try {
-    const parsed = JSON.parse(raw) as GroupSettings;
-    // ensure all fields exist
-    const def = defaultSettings();
-    return {
-      antilink: parsed.antilink ?? def.antilink,
-      antiforward: parsed.antiforward ?? def.antiforward,
-      autowarn: parsed.autowarn ?? def.autowarn,
-      maxWarns: parsed.maxWarns ?? def.maxWarns,
-      autoMuteMinutes: parsed.autoMuteMinutes ?? def.autoMuteMinutes,
-      whitelist: Array.isArray(parsed.whitelist) ? parsed.whitelist : []
-    };
-  } catch {
-    const def = defaultSettings();
-    await env.BOT_CONFIG.put(key, JSON.stringify(def));
-    return def;
-  }
-}
-
-async function saveGroupSettings(chatId: string, settings: GroupSettings, env: Env): Promise<void> {
-  const key = `settings:${chatId}`;
-  await env.BOT_CONFIG.put(key, JSON.stringify(settings));
-}
-
-/* ========== GROUP INFO STORAGE ========== */
-
-async function trackGroup(chat: TelegramChat, env: Env): Promise<void> {
-  const key = `group:${chat.id}`;
-  const now = Date.now();
-
-  const info: GroupInfo = {
-    id: chat.id,
-    title: chat.title,
-    type: chat.type,
-    active: true,
-    updatedAt: now
-  };
-
-  await env.BOT_CONFIG.put(key, JSON.stringify(info));
-}
-
-async function listActiveGroups(env: Env): Promise<GroupInfo[]> {
-  const groups: GroupInfo[] = [];
-  let cursor: string | undefined = undefined;
-
-  do {
-    const listResult = await env.BOT_CONFIG.list({ prefix: "group:", cursor });
-    cursor = listResult.cursor;
-    for (const key of listResult.keys) {
-      const raw = await env.BOT_CONFIG.get(key.name);
-      if (!raw) continue;
-      try {
-        const info = JSON.parse(raw) as GroupInfo;
-        if (info.active) groups.push(info);
-      } catch {
-        // ignore
-      }
-    }
-  } while (cursor);
-
-  return groups;
-}
-
-/* ========== MODERATION HELPERS ========== */
-
-function isForwarded(message: TelegramMessage): boolean {
-  return Boolean(
-    message.forward_from ||
-      message.forward_from_chat ||
-      message.forward_from_message_id ||
-      message.forward_sender_name ||
-      message.forward_date ||
-      message.is_automatic_forward
-  );
-}
-
-function containsProhibitedLink(text: string, whitelist: string[]): boolean {
-  const t = text.toLowerCase();
-
-  const patterns: RegExp[] = [
-    /\bhttps?:\/\/[^\s]+/i,                           // http:// or https://
-    /\bwww\.[^\s]+\.[^\s]+/i,                         // www.example.com
-    /\b(?:[a-z0-9-]+\.)+(com|net|org|io|gg|xyz|info|biz|co|me|link|live|shop|online)(\/[^\s]*)?/i,
-    /t\.me\/[^\s]+/i,
-    /telegram\.me\/[^\s]+/i,
-    /(joinchat|invite)\/[^\s]+/i
-  ];
-
-  // If no whitelist, any detected link is prohibited
-  if (!whitelist || whitelist.length === 0) {
-    return patterns.some((rx) => rx.test(text));
-  }
-
-  // If whitelist exists: only block links that don't contain any whitelisted domain
-  for (const rx of patterns) {
-    const matches = text.match(rx);
-    if (matches) {
-      const matchText = matches[0].toLowerCase();
-      const allowed = whitelist.some((domain) =>
-        matchText.includes(domain.toLowerCase())
-      );
-      if (!allowed) {
-        return true;
-      }
-    }
-  }
-
+  // If no domain found at all, it's fine
   return false;
 }
 
-async function handleRuleViolation(
-  chatId: string,
-  userId: number,
-  env: Env,
-  settings: GroupSettings,
-  reason: "link" | "forward"
-): Promise<void> {
-  const key = `violations:${chatId}:${userId}`;
-  const current = (await env.BOT_CONFIG.get(key)) || "0";
-  const count = parseInt(current, 10) || 0;
-  const newCount = count + 1;
-  await env.BOT_CONFIG.put(key, String(newCount));
+// Any forwarded message (including story forwards)
+function isForwarded(message: TelegramMessage): boolean {
+  // New Bot API: forward_origin field
+  if (message.forward_origin) return true;
+  // Old fields
+  if (message.forward_from || message.forward_from_chat || message.forward_sender_name) return true;
+  if (message.forward_date) return true;
+  return false;
+}
 
-  if (!settings.autowarn) return;
+// ====== Group & settings storage ======
 
-  if (newCount >= settings.maxWarns) {
-    // auto-mute
-    await muteUser(chatId, userId, settings.autoMuteMinutes, env);
-    await env.BOT_CONFIG.put(key, "0");
-
-    await sendText(
-      chatId,
-      `🔇 User ${userId} auto-muted for ${settings.autoMuteMinutes} minutes due to repeated ${reason}s.`,
-      env
-    );
-  } else {
-    await sendText(
-      chatId,
-      `⚠️ User ${userId} has been warned (${newCount}/${settings.maxWarns}) for ${reason}.`,
-      env
-    );
+async function ensureGroupKnown(chat: TelegramChat, env: Env): Promise<void> {
+  const key = `${GROUP_META_PREFIX}${chat.id}`;
+  const exists = await env.BOT_CONFIG.get(key);
+  if (!exists) {
+    const meta: GroupMeta = {
+      id: chat.id,
+      title: chat.title,
+      username: chat.username,
+      addedAt: Math.floor(Date.now() / 1000)
+    };
+    await env.BOT_CONFIG.put(key, JSON.stringify(meta));
   }
 }
 
-/* ========== COMMAND HANDLER ========== */
+async function removeGroup(chatId: number, env: Env): Promise<void> {
+  // Remove meta; settings and warns can stay, they won't be listed
+  const key = `${GROUP_META_PREFIX}${chatId}`;
+  await env.BOT_CONFIG.delete(key);
+}
 
-async function handleCommand(
-  message: TelegramMessage,
-  env: Env,
-  fromPrivate: boolean
-): Promise<void> {
-  const chat = message.chat;
-  const chatId = String(chat.id);
-  const user = message.from;
-  const text = message.text || "";
+function defaultSettings(): GroupSettings {
+  return {
+    antilink: true,
+    antiforward: true, // ON by default
+    maxWarns: 3,
+    autoMuteMinutes: 30,
+    whitelist: []
+  };
+}
 
-  const [rawCmd, ...rest] = text.split(" ");
-  const cmd = rawCmd.split("@")[0]; // strip @BotName
+async function loadSettings(chatId: number, env: Env): Promise<GroupSettings> {
+  const key = `${SETTINGS_PREFIX}${chatId}`;
+  const json = await env.BOT_CONFIG.get(key);
+  if (!json) {
+    const def = defaultSettings();
+    await env.BOT_CONFIG.put(key, JSON.stringify(def));
+    return def;
+  }
+  const parsed = JSON.parse(json) as Partial<GroupSettings>;
+  return {
+    ...defaultSettings(),
+    ...parsed,
+    whitelist: parsed.whitelist || []
+  };
+}
 
-  const isPrivate = chat.type === "private";
-  const isGroup = chat.type === "group" || chat.type === "supergroup";
+async function saveSettings(chatId: number, settings: GroupSettings, env: Env): Promise<void> {
+  const key = `${SETTINGS_PREFIX}${chatId}`;
+  await env.BOT_CONFIG.put(key, JSON.stringify(settings));
+}
 
-  const fromId = user?.id;
-  const isOwner = fromId ? isOwnerId(fromId, env) : false;
+function formatSettings(chatId: number, s: GroupSettings): string {
+  return [
+    `Settings for chat ${chatId}:`,
+    `• antilink: ${s.antilink ? "ON" : "OFF"}`,
+    `• antiforward: ${s.antiforward ? "ON" : "OFF"}`,
+    `• maxwarns: ${s.maxWarns}`,
+    `• automute: ${s.autoMuteMinutes} minutes`,
+    `• whitelist domains: ${s.whitelist.length ? s.whitelist.join(", ") : "(none)"}`
+  ].join("\n");
+}
 
-  // /start, /help always allowed but differ in message
-  if (cmd === "/start") {
-    if (isPrivate) {
-      if (!fromId || !isOwner) {
-        await sendText(
-          chatId,
-          "This bot is restricted. Only the configured owner(s) can manage settings.\nYou can still use it in groups for automatic moderation.",
-          env
-        );
-      } else {
-        await sendText(
-          chatId,
-          "Hi! I'm your group manager bot.\n\n" +
-            "Commands (global):\n" +
-            "/groups - List groups where I'm added\n" +
-            "/set <chat_id> <option> <value> - Change settings for a group\n" +
-            "/status <chat_id> - Show settings for a group\n\n" +
-            "Use me in groups to automatically delete links and forwarded messages and auto-mute rule breakers.",
-          env
-        );
+// ====== Delete queue (cron) ======
+
+async function processDeleteQueue(env: Env): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  let cursor: string | undefined = undefined;
+
+  while (true) {
+    const page = await env.BOT_CONFIG.list({
+      prefix: DELQUEUE_PREFIX,
+      limit: 100,
+      cursor
+    });
+
+    for (const key of page.keys) {
+      const value = await env.BOT_CONFIG.get(key.name);
+      if (!value) continue;
+      const job = JSON.parse(value) as DeleteJob;
+      if (job.deleteAt <= now) {
+        await deleteMessage(job.chatId, job.targetMessageId, env);
+        if (job.infoMessageId) {
+          await deleteMessage(job.chatId, job.infoMessageId, env);
+        }
+        await env.BOT_CONFIG.delete(key.name);
       }
+    }
+
+    if (!page.list_complete && page.cursor) {
+      cursor = page.cursor;
     } else {
-      await sendText(
-        chatId,
-        "I'm active in this group. I delete links and forwarded messages according to this group's settings.",
-        env
-      );
-    }
-    return;
-  }
-
-  if (cmd === "/help") {
-    if (isPrivate) {
-      if (!fromId || !isOwner) {
-        await sendText(
-          chatId,
-          "This bot is restricted. Only the configured owner(s) can manage settings.\nYou can still use it in groups for automatic moderation.",
-          env
-        );
-      } else {
-        await sendText(
-          chatId,
-          "Owner commands (use in PM):\n" +
-            "/groups - List groups where I'm added (ID + title)\n" +
-            "/status <chat_id> - Show settings for that group\n" +
-            "/set <chat_id> <option> <value> - Change settings\n\n" +
-            "Options:\n" +
-            "- antilink on|off\n" +
-            "- antiforward on|off\n" +
-            "- autowarn on|off\n" +
-            "- maxwarns <number>\n" +
-            "- automute <minutes>\n" +
-            "- whitelist add <domain>\n" +
-            "- whitelist remove <domain>\n" +
-            "- whitelist list\n\n" +
-            "Group commands (only owners, inside group):\n" +
-            "- /status - Show current settings for this group\n" +
-            "- reply /mute 10m - Mute user for 10 minutes\n" +
-            "- reply /unmute - Unmute user\n" +
-            "- reply /del 10s - Delete that message after delay (10s/10m/2h...)",
-          env
-        );
-      }
-    } else {
-      await sendText(
-        chatId,
-        "Group commands (owner only):\n" +
-          "- reply /mute 10m - Mute that user\n" +
-          "- reply /unmute - Unmute\n" +
-          "- reply /del 10s - Delete that message after delay\n" +
-          "- /status - Show this group's filters",
-        env
-      );
-    }
-    return;
-  }
-
-  // Everything below this line = owner-only
-  if (!fromId || !isOwner) {
-    // silently ignore for non-owners (to avoid spam in groups)
-    if (isPrivate) {
-      await sendText(
-        chatId,
-        "This bot is restricted. Only the configured owner(s) can manage settings.",
-        env
-      );
-    }
-    return;
-  }
-
-  // PM-only owner commands: /groups, /status <id>, /set <id> ...
-  if (isPrivate) {
-    if (cmd === "/groups") {
-      const groups = await listActiveGroups(env);
-      if (groups.length === 0) {
-        await sendText(chatId, "I don't know any groups yet. Add me to a group first.", env);
-        return;
-      }
-      const lines = groups.map(
-        (g) => `• ${g.title || "(no title)"} — \`${g.id}\``
-      );
-      await sendText(chatId, "Known active groups:\n" + lines.join("\n"), env);
-      return;
-    }
-
-    if (cmd === "/status") {
-      const argChatId = rest[0];
-      if (!argChatId) {
-        await sendText(chatId, "Usage: /status <chat_id>", env);
-        return;
-      }
-      const settings = await getGroupSettings(argChatId, env);
-      await sendText(chatId, formatSettings(argChatId, settings), env);
-      return;
-    }
-
-    if (cmd === "/set") {
-      const [targetChatId, option, ...valueParts] = rest;
-      if (!targetChatId || !option) {
-        await sendText(
-          chatId,
-          "Usage: /set <chat_id> <option> <value>\nExample: /set -100123456 antilink on",
-          env
-        );
-        return;
-      }
-      const value = valueParts.join(" ");
-      const settings = await getGroupSettings(targetChatId, env);
-      const reply = await applySetting(targetChatId, settings, option.toLowerCase(), value, env);
-      await sendText(chatId, reply, env);
-      return;
-    }
-  }
-
-  // Group-only owner commands: /status, /mute, /unmute, /del
-  if (isGroup) {
-    const groupChatId = chatId;
-
-    if (cmd === "/status") {
-      const settings = await getGroupSettings(groupChatId, env);
-      await sendText(groupChatId, formatSettings(groupChatId, settings), env);
-      return;
-    }
-
-    if (cmd === "/mute") {
-      const reply = message.reply_to_message;
-      if (!reply || !reply.from) {
-        await sendText(groupChatId, "Reply to a user's message with /mute <time>, e.g. /mute 10m", env);
-        return;
-      }
-      const targetUser = reply.from;
-      const durationSeconds = parseDurationSeconds(rest[0]) || 24 * 60 * 60; // default 1 day
-      const durationMinutes = Math.floor(durationSeconds / 60);
-
-      await muteUser(groupChatId, targetUser.id, durationMinutes, env);
-      await sendText(
-        groupChatId,
-        `🔇 Muted ${displayName(targetUser)} for ${rest[0] || "24h"}.`,
-        env
-      );
-      return;
-    }
-
-    if (cmd === "/unmute") {
-      const reply = message.reply_to_message;
-      if (!reply || !reply.from) {
-        await sendText(groupChatId, "Reply to a user's message with /unmute", env);
-        return;
-      }
-      const targetUser = reply.from;
-      await unmuteUser(groupChatId, targetUser.id, env);
-      await sendText(groupChatId, `🔊 Unmuted ${displayName(targetUser)}.`, env);
-      return;
-    }
-
-    if (cmd === "/del") {
-      const reply = message.reply_to_message;
-      if (!reply) {
-        await sendText(groupChatId, "Reply to a message with /del <time>, e.g. /del 10s or /del 10m", env);
-        return;
-      }
-
-      const delaySeconds = parseDurationSeconds(rest[0]);
-      if (!delaySeconds) {
-        // delete immediately
-        await deleteMessage(groupChatId, reply.message_id, env);
-        return;
-      }
-
-      const deleteAt = Math.floor(Date.now() / 1000) + delaySeconds;
-
-      // send confirmation (we will delete it together with target)
-      const confirm = await tgCall("sendMessage", env, {
-        chat_id: groupChatId,
-        text: `🕒 This message and the replied message will be deleted in ${rest[0]}.`
-      });
-
-      const confirmId: number | undefined = confirm?.result?.message_id;
-
-      const entry: DelEntry = {
-        chat_id: groupChatId,
-        message_ids: confirmId
-          ? [reply.message_id, confirmId]
-          : [reply.message_id],
-        delete_at: deleteAt
-      };
-
-      const key = `delqueue:${deleteAt}:${groupChatId}:${reply.message_id}`;
-      await env.BOT_CONFIG.put(key, JSON.stringify(entry));
-
-      return;
+      break;
     }
   }
 }
 
-/* ========== SETTINGS APPLICATION ==========\ */
+// ====== Admin / owner helpers ======
 
-function formatSettings(chatId: string, s: GroupSettings): string {
-  return (
-    `Settings for chat ${chatId}:\n` +
-    `- antilink: ${s.antilink ? "ON" : "OFF"}\n` +
-    `- antiforward: ${s.antiforward ? "ON" : "OFF"}\n` +
-    `- autowarn: ${s.autowarn ? "ON" : "OFF"}\n` +
-    `- maxwarns: ${s.maxWarns}\n` +
-    `- automute: ${s.autoMuteMinutes} minutes\n` +
-    `- whitelist: ${s.whitelist.length ? s.whitelist.join(", ") : "(none)"}`
-  );
+function getOwnerIds(env: Env): number[] {
+  const raw = env.OWNER_USER_IDS;
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((s) => parseInt(s.trim(), 10))
+    .filter((n) => !!n);
 }
 
-async function applySetting(
-  chatId: string,
-  settings: GroupSettings,
-  option: string,
-  value: string,
-  env: Env
-): Promise<string> {
-  const trimmedValue = value.trim();
-
-  if (option === "antilink") {
-    if (trimmedValue !== "on" && trimmedValue !== "off") {
-      return "antilink value must be 'on' or 'off'.";
-    }
-    settings.antilink = trimmedValue === "on";
-    await saveGroupSettings(chatId, settings, env);
-    return `antilink set to ${trimmedValue.toUpperCase()} for chat ${chatId}.`;
-  }
-
-  if (option === "antiforward") {
-    if (trimmedValue !== "on" && trimmedValue !== "off") {
-      return "antiforward value must be 'on' or 'off'.";
-    }
-    settings.antiforward = trimmedValue === "on";
-    await saveGroupSettings(chatId, settings, env);
-    return `antiforward set to ${trimmedValue.toUpperCase()} for chat ${chatId}.`;
-  }
-
-  if (option === "autowarn") {
-    if (trimmedValue !== "on" && trimmedValue !== "off") {
-      return "autowarn value must be 'on' or 'off'.";
-    }
-    settings.autowarn = trimmedValue === "on";
-    await saveGroupSettings(chatId, settings, env);
-    return `autowarn set to ${trimmedValue.toUpperCase()} for chat ${chatId}.`;
-  }
-
-  if (option === "maxwarns") {
-    const n = parseInt(trimmedValue, 10);
-    if (!Number.isFinite(n) || n < 1) {
-      return "maxwarns must be a positive integer.";
-    }
-    settings.maxWarns = n;
-    await saveGroupSettings(chatId, settings, env);
-    return `maxwarns set to ${n} for chat ${chatId}.`;
-  }
-
-  if (option === "automute") {
-    const n = parseInt(trimmedValue, 10);
-    if (!Number.isFinite(n) || n < 1) {
-      return "automute must be a positive integer (minutes).";
-    }
-    settings.autoMuteMinutes = n;
-    await saveGroupSettings(chatId, settings, env);
-    return `automute set to ${n} minutes for chat ${chatId}.`;
-  }
-
-  if (option === "whitelist") {
-    const [sub, domainRaw] = trimmedValue.split(/\s+/, 2);
-    const domain = (domainRaw || "").toLowerCase();
-
-    if (sub === "add") {
-      if (!domain) return "Usage: whitelist add <domain>";
-      if (!settings.whitelist.includes(domain)) {
-        settings.whitelist.push(domain);
-      }
-      await saveGroupSettings(chatId, settings, env);
-      return `Added "${domain}" to whitelist for chat ${chatId}.`;
-    }
-
-    if (sub === "remove") {
-      if (!domain) return "Usage: whitelist remove <domain>";
-      settings.whitelist = settings.whitelist.filter((d) => d !== domain);
-      await saveGroupSettings(chatId, settings, env);
-      return `Removed "${domain}" from whitelist for chat ${chatId}.`;
-    }
-
-    if (sub === "list") {
-      return settings.whitelist.length
-        ? `Whitelist for ${chatId}: ${settings.whitelist.join(", ")}`
-        : `Whitelist for ${chatId} is empty.`;
-    }
-
-    return "Usage: /set <chat_id> whitelist add|remove|list <domain>";
-  }
-
-  return "Unknown option. Valid options: antilink, antiforward, autowarn, maxwarns, automute, whitelist.";
+function isOwner(userId: number, env: Env): boolean {
+  const owners = getOwnerIds(env);
+  if (!owners.length) return true; // if not configured, treat everyone as owner
+  return owners.includes(userId);
 }
 
-/* ========== MUTE / UNMUTE / DELETE HELPERS ========== */
+// Some admins may be anonymous – their messages have sender_chat = group
+async function isAdminLikeSender(message: TelegramMessage, env: Env): Promise<boolean> {
+  const chatId = message.chat.id;
+  const from = message.from;
+  const senderChat = message.sender_chat;
 
-async function muteUser(chatId: string, userId: number, minutes: number, env: Env): Promise<void> {
+  // Anonymous admin: sender_chat.id == chat.id
+  if (senderChat && senderChat.id === chatId) {
+    return true;
+  }
+
+  if (!from) return false;
+  return await isAdmin(chatId, from.id, env);
+}
+
+async function isAdmin(chatId: number, userId: number, env: Env): Promise<boolean> {
+  try {
+    const res = await tgCall("getChatMember", env, {
+      chat_id: chatId,
+      user_id: userId
+    });
+    if (!res || res.ok === false) return false;
+    const status = res.result.status as string;
+    return status === "creator" || status === "administrator";
+  } catch {
+    return false;
+  }
+}
+
+// ====== Telegram API helpers ======
+
+async function tgCall(
+  method: string,
+  env: Env,
+  body: Record<string, unknown>
+): Promise<any> {
+  const url = `${TG_API_BASE}/bot${env.TELEGRAM_BOT_TOKEN}/${method}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  let data: any;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
+  }
+
+  if (!res.ok || (data && data.ok === false)) {
+    console.error("Telegram API error", method, data || res.statusText);
+  }
+
+  return data;
+}
+
+async function sendText(
+  chatId: number | string,
+  text: string,
+  env: Env,
+  extra?: Record<string, unknown>
+): Promise<{ message_id: number } | null> {
+  const res = await tgCall("sendMessage", env, {
+    chat_id: chatId,
+    text,
+    ...(extra || {})
+  });
+  if (res && res.ok) {
+    return { message_id: res.result.message_id as number };
+  }
+  return null;
+}
+
+async function deleteMessage(chatId: number, messageId: number, env: Env): Promise<void> {
+  await tgCall("deleteMessage", env, {
+    chat_id: chatId,
+    message_id: messageId
+  });
+}
+
+async function muteUser(chatId: number, userId: number, minutes: number, env: Env): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   const untilDate = now + minutes * 60;
 
@@ -771,7 +852,7 @@ async function muteUser(chatId: string, userId: number, minutes: number, env: En
   });
 }
 
-async function unmuteUser(chatId: string, userId: number, env: Env): Promise<void> {
+async function unmuteUser(chatId: number, userId: number, env: Env): Promise<void> {
   const permissions = {
     can_send_messages: true,
     can_send_audios: true,
@@ -792,100 +873,59 @@ async function unmuteUser(chatId: string, userId: number, env: Env): Promise<voi
   });
 }
 
-async function deleteMessage(chatId: string, messageId: number, env: Env): Promise<void> {
-  await tgCall("deleteMessage", env, {
-    chat_id: chatId,
-    message_id: messageId
-  });
+// ====== Misc helpers ======
+
+function displayName(user: TelegramUser): string {
+  if (user.username) return `@${user.username}`;
+  const fullName = `${user.first_name || ""} ${user.last_name || ""}`.trim();
+  if (fullName) return fullName;
+  return `${user.id}`;
 }
 
-/* ========== CRON HANDLER FOR /del QUEUE ========== */
+function parseDuration(arg: string | undefined): number {
+  // minutes; default 24h
+  if (!arg) return 24 * 60;
+  const m = arg.match(/^(\d+)([smhd])$/i);
+  if (!m) return 24 * 60;
 
-async function handleCron(env: Env): Promise<void> {
-  const now = Math.floor(Date.now() / 1000);
-  let cursor: string | undefined = undefined;
-
-  do {
-    const listResult = await env.BOT_CONFIG.list({ prefix: "delqueue:", cursor });
-    cursor = listResult.cursor;
-
-    for (const k of listResult.keys) {
-      const name = k.name;
-      const parts = name.split(":");
-      const ts = Number(parts[1] || 0);
-      if (!ts || ts > now) continue;
-
-      const raw = await env.BOT_CONFIG.get(name);
-      if (!raw) {
-        await env.BOT_CONFIG.delete(name);
-        continue;
-      }
-
-      let entry: DelEntry | null = null;
-      try {
-        entry = JSON.parse(raw) as DelEntry;
-      } catch {
-        await env.BOT_CONFIG.delete(name);
-        continue;
-      }
-
-      if (!entry) {
-        await env.BOT_CONFIG.delete(name);
-        continue;
-      }
-
-      for (const msgId of entry.message_ids) {
-        await deleteMessage(entry.chat_id, msgId, env);
-      }
-
-      await env.BOT_CONFIG.delete(name);
-    }
-  } while (cursor);
-}
-
-/* ========== UTILITIES ========== */
-
-function parseDurationSeconds(arg?: string): number | null {
-  if (!arg) return null;
-  const m = arg.match(/^(\d+)(s|m|h|d)$/i);
-  if (!m) return null;
   const value = parseInt(m[1], 10);
   const unit = m[2].toLowerCase();
+
+  if (unit === "s") return Math.max(1, Math.round(value / 60));
+  if (unit === "m") return value;
+  if (unit === "h") return value * 60;
+  if (unit === "d") return value * 60 * 24;
+  return 24 * 60;
+}
+
+function parseDurationSeconds(arg: string | undefined): number {
+  // seconds; default 60s
+  if (!arg) return 60;
+  const m = arg.match(/^(\d+)([smhd])$/i);
+  if (!m) return 60;
+
+  const value = parseInt(m[1], 10);
+  const unit = m[2].toLowerCase();
+
   if (unit === "s") return value;
   if (unit === "m") return value * 60;
   if (unit === "h") return value * 60 * 60;
   if (unit === "d") return value * 60 * 60 * 24;
-  return null;
+  return 60;
 }
 
-async function sendText(chatId: string | number, text: string, env: Env): Promise<void> {
-  await tgCall("sendMessage", env, { chat_id: chatId, text });
-}
-
-async function tgCall(method: string, env: Env, body: Record<string, unknown>): Promise<any> {
-  const url = `${TG_API_BASE}/bot${env.TELEGRAM_BOT_TOKEN}/${method}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
-  });
-
-  let data: any = null;
-  try {
-    data = await res.json();
-  } catch {
-    // ignore
+function normalizeDomain(input: string): string | null {
+  let d = input.trim().toLowerCase();
+  if (!d) return null;
+  if (d.startsWith("http://") || d.startsWith("https://")) {
+    try {
+      const u = new URL(d);
+      d = u.hostname.toLowerCase();
+    } catch {
+      // fall back
+    }
   }
-
-  if (!res.ok || (data && data.ok === false)) {
-    console.error("Telegram API error", method, data || res.statusText);
-  }
-
-  return data;
-}
-
-function displayName(user: TelegramUser): string {
-  if (user.username) return `@${user.username}`;
-  const full = `${user.first_name || ""} ${user.last_name || ""}`.trim();
-  return full || String(user.id);
+  if (d.startsWith("www.")) d = d.slice(4);
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(d)) return null;
+  return d;
 }
