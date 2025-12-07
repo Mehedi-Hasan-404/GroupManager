@@ -61,10 +61,8 @@ interface GroupSettings {
   autoDeleteJoin: boolean;
   autoDeleteLeave: boolean;
   warnThreshold: number;
-  // auto mute duration stored as minutes but can be set using "10s/10m/1h/1d"
-  autoMuteMinutes: number;
-  // bot message TTL in seconds; 0 = never auto delete
-  botMsgTtlSeconds: number;
+  autoMuteMinutes: number; // internal: minutes to mute after threshold
+  botMsgTtlSeconds: number; // how long bot messages live, in seconds (0 = never delete)
 }
 
 const DEFAULT_SETTINGS: GroupSettings = {
@@ -74,14 +72,15 @@ const DEFAULT_SETTINGS: GroupSettings = {
   autoDeleteJoin: true,
   autoDeleteLeave: true,
   warnThreshold: 3,
-  autoMuteMinutes: 30, // 30 minutes
-  botMsgTtlSeconds: 300 // 5 minutes
+  autoMuteMinutes: 30,
+  botMsgTtlSeconds: 300
 };
 
 const WARN_PREFIX = "warn:";
 const GROUP_SETTINGS_PREFIX = "g:";
 const GROUP_META_PREFIX = "meta:";
 const DEL_PREFIX = "del:";
+const RULES_PREFIX = "rules:";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -114,7 +113,6 @@ export default {
   }
 };
 
-// Parse OWNER_USER_IDS="12345,-1001234567890,..." into a Set<string>
 function parseOwners(env: Env): Set<string> {
   const raw = env.OWNER_USER_IDS || "";
   return new Set(
@@ -125,19 +123,14 @@ function parseOwners(env: Env): Set<string> {
   );
 }
 
-/**
- * Checks if the message author is allowed:
- * - user id (msg.from.id)
- * - sender_chat id (for channel posts / anonymous)
- * - chat id (for anonymous admins using group identity)
- */
 function isOwnerOrAllowed(env: Env, msg: TgMessage): boolean {
   const owners = parseOwners(env);
   const idsToCheck: string[] = [];
 
+  // normal user
   if (msg.from) idsToCheck.push(String(msg.from.id));
+  // anonymous / send-as-channel / send-as-group
   if (msg.sender_chat) idsToCheck.push(String(msg.sender_chat.id));
-  if (msg.chat) idsToCheck.push(String(msg.chat.id));
 
   for (const id of idsToCheck) {
     if (owners.has(id)) return true;
@@ -206,6 +199,8 @@ async function handleMyChatMember(update: any, env: Env): Promise<void> {
       await env.BOT_CONFIG.delete(key);
       const settingsKey = GROUP_SETTINGS_PREFIX + chatIdStr + ":settings";
       await env.BOT_CONFIG.delete(settingsKey);
+      const rulesKey = RULES_PREFIX + chatIdStr;
+      await env.BOT_CONFIG.delete(rulesKey);
       return;
     }
 
@@ -295,6 +290,16 @@ async function storeGroupMeta(chat: TgChat, env: Env): Promise<void> {
   await env.BOT_CONFIG.put(key, JSON.stringify(meta));
 }
 
+async function getGroupRules(chatId: number, env: Env): Promise<string | null> {
+  const key = RULES_PREFIX + String(chatId);
+  return await env.BOT_CONFIG.get(key);
+}
+
+async function saveGroupRules(chatId: number, rules: string, env: Env): Promise<void> {
+  const key = RULES_PREFIX + String(chatId);
+  await env.BOT_CONFIG.put(key, rules);
+}
+
 async function handleViolation(
   chatId: number,
   userId: number,
@@ -376,9 +381,12 @@ async function handlePrivateMessage(message: TgMessage, env: Env): Promise<void>
         "/whitelist <group_id> add <domain>",
         "/whitelist <group_id> remove <domain>",
         "/whitelist <group_id> list",
+        "/rules <group_id> – Show rules for a group",
+        "/setrules <group_id> <rules text> – Set rules text for a group",
         "",
         "Group commands:",
-        "/status – show group filters",
+        "/status – show group filters (owners/allowed only)",
+        "/rules – show group rules (everyone)",
         "/mute <time> (reply) – mute user (10s/10m/1h/1d etc)",
         "/unmute (reply) – unmute user",
         "/warn (reply) – manual warn",
@@ -444,7 +452,7 @@ async function handlePrivateMessage(message: TgMessage, env: Env): Promise<void>
     case "/set": {
       const gid = args[0];
       const key = (args[1] || "").toLowerCase();
-      const valueRaw = args.slice(2).join(" "); // allow values like "10m" or "1h"
+      const valueRaw = args[2];
 
       if (!gid || !key || !valueRaw) {
         await sendText(
@@ -461,8 +469,7 @@ async function handlePrivateMessage(message: TgMessage, env: Env): Promise<void>
       const valueLower = valueRaw.toLowerCase();
 
       if (key === "antilink" || key === "antiforward" || key === "joinclean" || key === "leaveclean") {
-        const boolVal =
-          valueLower === "on" || valueLower === "true" || valueLower === "1" || valueLower === "yes";
+        const boolVal = valueLower === "on" || valueLower === "true" || valueLower === "1";
         if (key === "antilink") settings.antilink = boolVal;
         if (key === "antiforward") settings.antiforward = boolVal;
         if (key === "joinclean") settings.autoDeleteJoin = boolVal;
@@ -470,15 +477,12 @@ async function handlePrivateMessage(message: TgMessage, env: Env): Promise<void>
       } else if (key === "warnthreshold") {
         const n = parseInt(valueRaw, 10);
         if (!isNaN(n) && n > 0) settings.warnThreshold = n;
-      } else if (key === "automute" || key === "automutemin") {
-        // allow /set <gid> automute 10m / 1h / 600 etc.
-        const secs = parseDurationToSeconds(valueRaw, settings.autoMuteMinutes * 60);
-        const mins = Math.max(1, Math.round(secs / 60));
-        settings.autoMuteMinutes = mins;
+      } else if (key === "automutemin" || key === "automute") {
+        const mins = parseDuration(valueRaw);
+        if (mins > 0) settings.autoMuteMinutes = mins;
       } else if (key === "ttl") {
-        // ttl in seconds, but supports 10s/1m/1h/1d or plain number
-        const secs = parseDurationToSeconds(valueRaw, settings.botMsgTtlSeconds);
-        if (!isNaN(secs) && secs >= 0) settings.botMsgTtlSeconds = secs;
+        const n = parseInt(valueRaw, 10);
+        if (!isNaN(n) && n >= 0) settings.botMsgTtlSeconds = n;
       } else {
         await sendText(
           chatIdStr,
@@ -545,6 +549,35 @@ async function handlePrivateMessage(message: TgMessage, env: Env): Promise<void>
       break;
     }
 
+    case "/rules": {
+      const gid = args[0];
+      if (!gid) {
+        await sendText(chatIdStr, "Usage: /rules <group_id>", env);
+        return;
+      }
+      const groupId = Number(gid);
+      const rules = await getGroupRules(groupId, env);
+      const out =
+        rules && rules.trim().length > 0
+          ? `Rules for group ${groupId}:\n\n${rules}`
+          : `No rules set yet for group ${groupId}.`;
+      await sendText(chatIdStr, out, env);
+      break;
+    }
+
+    case "/setrules": {
+      const gid = args[0];
+      const rulesText = args.slice(1).join(" ");
+      if (!gid || !rulesText.trim()) {
+        await sendText(chatIdStr, "Usage: /setrules <group_id> <rules text>", env);
+        return;
+      }
+      const groupId = Number(gid);
+      await saveGroupRules(groupId, rulesText, env);
+      await sendText(chatIdStr, "Rules updated for group " + groupId + ".", env);
+      break;
+    }
+
     default:
       break;
   }
@@ -604,10 +637,25 @@ async function handleGroupCommand(
   const chatIdStr = String(chat.id);
   const text = message.text || "";
 
-  if (!isOwnerOrAllowed(env, message)) return;
-
   const [cmdRaw, ...args] = text.split(" ");
   const cmd = cmdRaw.split("@")[0];
+
+  // /rules is allowed for everyone in the group
+  if (cmd === "/rules") {
+    const rules = await getGroupRules(chat.id, env);
+    const content =
+      rules && rules.trim().length > 0
+        ? rules
+        : "No rules have been set for this group yet.";
+    const msg = await sendTextWithResult(chatIdStr, content, env);
+    if (msg && settings.botMsgTtlSeconds > 0) {
+      await scheduleDeletion(chatIdStr, msg.message_id, settings.botMsgTtlSeconds / 60, env);
+    }
+    return;
+  }
+
+  // All other group commands restricted to owners / allowed IDs
+  if (!isOwnerOrAllowed(env, message)) return;
 
   switch (cmd) {
     case "/status": {
@@ -622,13 +670,11 @@ async function handleGroupCommand(
     case "/mute": {
       if (!message.reply_to_message || !message.reply_to_message.from) return;
       const target = message.reply_to_message.from;
-      const durationRaw = args[0] || "24h";
-      const durationSeconds = parseDurationToSeconds(durationRaw, 24 * 60 * 60);
-      const durationMinutes = Math.max(1, Math.round(durationSeconds / 60));
-      await muteUser(chatIdStr, target.id, durationMinutes, env);
+      const duration = parseDuration(args[0] || "24h");
+      await muteUser(chatIdStr, target.id, duration, env);
       const m = await sendTextWithResult(
         chatIdStr,
-        `🔇 Muted ${displayName(target)} for ${durationRaw}.`,
+        `🔇 Muted ${displayName(target)} for ${args[0] || "24h"}.`,
         env
       );
       if (m) {
@@ -658,18 +704,17 @@ async function handleGroupCommand(
     case "/del": {
       if (!message.reply_to_message) return;
       const targetMsgId = message.reply_to_message.message_id;
-      const delayRaw = args[0] || "10s";
-      const delaySeconds = parseDurationToSeconds(delayRaw, 10);
+      const delay = parseDuration(args[0] || "10s");
 
-      await scheduleDeletion(chatIdStr, targetMsgId, delaySeconds, env);
+      await scheduleDeletion(chatIdStr, targetMsgId, delay, env);
 
       const info = await sendTextWithResult(
         chatIdStr,
-        `🗑️ This message and the replied one will be deleted after ${delayRaw}.`,
+        `🗑️ This message and the replied one will be deleted after ${args[0] || "10s"}.`,
         env
       );
       if (info) {
-        await scheduleDeletion(chatIdStr, info.message_id, delaySeconds, env);
+        await scheduleDeletion(chatIdStr, info.message_id, delay, env);
       }
 
       break;
@@ -680,33 +725,16 @@ async function handleGroupCommand(
   }
 }
 
-/**
- * Parse human duration:
- * - "10s" => 10
- * - "10m" => 600
- * - "1h"  => 3600
- * - "1d"  => 86400
- * - "600" => 600 (plain seconds)
- * If invalid, fallback to defaultSeconds.
- */
-function parseDurationToSeconds(s: string, defaultSeconds: number): number {
-  const trimmed = s.trim();
-  if (!trimmed) return defaultSeconds;
-
-  const m = trimmed.match(/^(\d+)(s|m|h|d)$/i);
-  if (m) {
-    const value = parseInt(m[1], 10);
-    const unit = m[2].toLowerCase();
-    if (unit === "s") return value;
-    if (unit === "m") return value * 60;
-    if (unit === "h") return value * 60 * 60;
-    if (unit === "d") return value * 60 * 60 * 24;
-  }
-
-  const n = parseInt(trimmed, 10);
-  if (!isNaN(n) && n >= 0) return n;
-
-  return defaultSeconds;
+function parseDuration(s: string): number {
+  const m = s.match(/^(\d+)(s|m|h|d)$/i);
+  if (!m) return 24 * 60;
+  const value = parseInt(m[1], 10);
+  const unit = m[2].toLowerCase();
+  if (unit === "s") return Math.max(1, Math.floor(value / 60)) || 1;
+  if (unit === "m") return value;
+  if (unit === "h") return value * 60;
+  if (unit === "d") return value * 60 * 24;
+  return 24 * 60;
 }
 
 async function muteUser(chatId: string, userId: number, minutes: number, env: Env): Promise<void> {
@@ -789,7 +817,7 @@ async function sendEphemeralText(
   }
   const msg = await sendTextWithResult(chatId, text, env);
   if (msg) {
-    await scheduleDeletion(chatId, msg.message_id, ttlSeconds, env);
+    await scheduleDeletion(chatId, msg.message_id, ttlSeconds / 60, env);
   }
 }
 
@@ -800,18 +828,15 @@ async function deleteMessage(chatId: string, messageId: number, env: Env): Promi
   });
 }
 
-/**
- * Schedule deletion of a message after delaySeconds from "now".
- */
 async function scheduleDeletion(
   chatId: string,
   messageId: number,
-  delaySeconds: number,
+  minutesFromNow: number,
   env: Env
 ): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
-  const safeDelay = Math.max(1, Math.floor(delaySeconds));
-  const when = now + safeDelay;
+  const delaySeconds = Math.max(1, minutesFromNow * 60);
+  const when = now + delaySeconds;
   const key = `${DEL_PREFIX}${when}:${chatId}:${messageId}`;
   await env.BOT_CONFIG.put(key, "1");
 }
