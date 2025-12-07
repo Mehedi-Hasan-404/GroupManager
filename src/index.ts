@@ -324,12 +324,13 @@ async function handleViolation(
 }
 
 async function handlePrivateMessage(message: TgMessage, env: Env): Promise<void> {
-  const user = message.from;
-  if (!user) return;
+  // NOTE: we now allow either a real user (`from`) or an allowed `sender_chat`
+  // (e.g. your channel when you're anonymous) to control the bot in PM.
   const chatIdStr = String(message.chat.id);
   const isOwner = isOwnerOrAllowed(env, message);
 
   const text = message.text || "";
+  if (!text) return;
 
   if (!isOwner) {
     if (text.startsWith("/start")) {
@@ -466,7 +467,11 @@ async function handlePrivateMessage(message: TgMessage, env: Env): Promise<void>
         const n = parseInt(valueRaw, 10);
         if (!isNaN(n) && n >= 0) settings.botMsgTtlSeconds = n;
       } else {
-        await sendText(chatIdStr, "Unknown key. Allowed: antilink, antiforward, joinclean, leaveclean, warnthreshold, automutemin, ttl", env);
+        await sendText(
+          chatIdStr,
+          "Unknown key. Allowed: antilink, antiforward, joinclean, leaveclean, warnthreshold, automutemin, ttl",
+          env
+        );
         return;
       }
 
@@ -492,11 +497,11 @@ async function handlePrivateMessage(message: TgMessage, env: Env): Promise<void>
       const settings = await getGroupSettings(groupId, env);
 
       if (sub === "list") {
-        const text =
+        const txt =
           settings.whitelist.length === 0
             ? "No whitelisted domains."
             : "Whitelisted domains:\n" + settings.whitelist.join("\n");
-        await sendText(chatIdStr, text, env);
+        await sendText(chatIdStr, txt, env);
       } else if (sub === "add") {
         const domain = args[2];
         if (!domain) {
@@ -558,7 +563,10 @@ async function listGroups(env: Env): Promise<{ id: number; title: string; active
   return out;
 }
 
-async function getGroupMeta(groupId: number, env: Env): Promise<{ id: number; title: string; active: boolean } | null> {
+async function getGroupMeta(
+  groupId: number,
+  env: Env
+): Promise<{ id: number; title: string; active: boolean } | null> {
   const key = GROUP_META_PREFIX + String(groupId);
   const raw = await env.BOT_CONFIG.get(key);
   if (!raw) return null;
@@ -574,7 +582,11 @@ async function getGroupMeta(groupId: number, env: Env): Promise<{ id: number; ti
   }
 }
 
-async function handleGroupCommand(message: TgMessage, settings: GroupSettings, env: Env): Promise<void> {
+async function handleGroupCommand(
+  message: TgMessage,
+  settings: GroupSettings,
+  env: Env
+): Promise<void> {
   const chat = message.chat;
   const chatIdStr = String(chat.id);
   const text = message.text || "";
@@ -615,11 +627,7 @@ async function handleGroupCommand(message: TgMessage, settings: GroupSettings, e
       if (!message.reply_to_message || !message.reply_to_message.from) return;
       const target = message.reply_to_message.from;
       await unmuteUser(chatIdStr, target.id, env);
-      const m = await sendTextWithResult(
-        chatIdStr,
-        `🔊 Unmuted ${displayName(target)}.`,
-        env
-      );
+      const m = await sendTextWithResult(chatIdStr, `🔊 Unmuted ${displayName(target)}.`, env);
       if (m) {
         await scheduleDeletion(chatIdStr, m.message_id, settings.botMsgTtlSeconds, env);
       }
