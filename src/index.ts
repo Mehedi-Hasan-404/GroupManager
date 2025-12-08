@@ -30,20 +30,17 @@ interface TgMessage {
   text?: string;
   caption?: string;
 
-  // reply
   reply_to_message?: TgMessage;
 
-  // join / leave
   new_chat_members?: TgUser[];
   left_chat_member?: TgUser;
 
-  // forwards / stories
   is_automatic_forward?: boolean;
   forward_from?: TgUser;
   forward_from_chat?: TgChat;
   forward_from_message_id?: number;
   forward_date?: number;
-  // story / forward_origin exist in recent Bot API; we keep as any
+
   [k: string]: any;
 }
 
@@ -61,8 +58,8 @@ interface GroupSettings {
   autoDeleteJoin: boolean;
   autoDeleteLeave: boolean;
   warnThreshold: number;
-  autoMuteMinutes: number; // internal: minutes to mute after threshold
-  botMsgTtlSeconds: number; // how long bot messages live, in seconds (0 = never delete)
+  autoMuteMinutes: number; // minutes
+  botMsgTtlSeconds: number; // seconds (0 = never delete)
 }
 
 const DEFAULT_SETTINGS: GroupSettings = {
@@ -126,12 +123,8 @@ function parseOwners(env: Env): Set<string> {
 function isOwnerOrAllowed(env: Env, msg: TgMessage): boolean {
   const owners = parseOwners(env);
   const idsToCheck: string[] = [];
-
-  // normal user
   if (msg.from) idsToCheck.push(String(msg.from.id));
-  // anonymous / send-as-channel / send-as-group
   if (msg.sender_chat) idsToCheck.push(String(msg.sender_chat.id));
-
   for (const id of idsToCheck) {
     if (owners.has(id)) return true;
   }
@@ -148,7 +141,6 @@ async function handleMessage(message: TgMessage, env: Env): Promise<void> {
   }
 
   await storeGroupMeta(chat, env);
-
   const settings = await getGroupSettings(chat.id, env);
 
   if (settings.autoDeleteJoin && message.new_chat_members && message.new_chat_members.length > 0) {
@@ -173,7 +165,6 @@ async function handleMessage(message: TgMessage, env: Env): Promise<void> {
 
   const isPrivileged = isOwnerOrAllowed(env, message);
 
-  // ⚙️ Moderation should NOT affect owner/allowed IDs
   if (!isPrivileged && settings.antiforward && isForwarded(message)) {
     await deleteMessage(chatIdStr, message.message_id, env);
     await handleViolation(chat.id, user, "forward", env);
@@ -267,7 +258,6 @@ async function getGroupSettings(chatId: number, env: Env): Promise<GroupSettings
   const key = GROUP_SETTINGS_PREFIX + String(chatId) + ":settings";
   const raw = await env.BOT_CONFIG.get(key);
   if (!raw) return { ...DEFAULT_SETTINGS };
-
   try {
     const parsed = JSON.parse(raw);
     return { ...DEFAULT_SETTINGS, ...parsed };
@@ -330,7 +320,6 @@ async function handleViolation(
   const userLabel = formatUserTag(user);
 
   const warnText = `⚠️ Warning ${newCount}/${settings.warnThreshold} for ${userLabel} (${reasonText}).`;
-
   await sendEphemeralText(chatIdStr, warnText, settings.botMsgTtlSeconds, env);
 
   if (newCount >= settings.warnThreshold) {
@@ -396,7 +385,7 @@ async function handlePrivateMessage(message: TgMessage, env: Env): Promise<void>
         "/mute <time> (reply) – mute user (10s/10m/1h/1d etc)",
         "/unmute (reply) – unmute user",
         "/warn (reply) – manual warn",
-        "/dwarn (reply) – remove one warning from a user",
+        "/dwarn (reply) – remove one warning",
         "/del <time> (reply) – delete that message after a delay"
       ].join("\n");
       await sendText(chatIdStr, help, env);
@@ -521,11 +510,11 @@ async function handlePrivateMessage(message: TgMessage, env: Env): Promise<void>
       const settings = await getGroupSettings(groupId, env);
 
       if (sub === "list") {
-        const text =
+        const textOut =
           settings.whitelist.length === 0
             ? "No whitelisted domains."
             : "Whitelisted domains:\n" + settings.whitelist.join("\n");
-        await sendText(chatIdStr, text, env);
+        await sendText(chatIdStr, textOut, env);
       } else if (sub === "add") {
         const domain = args[2];
         if (!domain) {
@@ -647,7 +636,7 @@ async function handleGroupCommand(
   const [cmdRaw, ...args] = text.split(" ");
   const cmd = cmdRaw.split("@")[0];
 
-  // /rules is allowed for everyone in the group
+  // /rules: allowed for everyone, but reply obeys ttl
   if (cmd === "/rules") {
     const rules = await getGroupRules(chat.id, env);
     const content =
@@ -658,10 +647,11 @@ async function handleGroupCommand(
     if (msg && settings.botMsgTtlSeconds > 0) {
       await scheduleDeletion(chatIdStr, msg.message_id, settings.botMsgTtlSeconds / 60, env);
     }
+    // (you can also ttl-delete the /rules command itself if you want)
     return;
   }
 
-  // All other group commands restricted to owners / allowed IDs
+  // Others: only owner / allowed
   if (!isOwnerOrAllowed(env, message)) return;
 
   switch (cmd) {
@@ -670,6 +660,7 @@ async function handleGroupCommand(
       const msg = await sendTextWithResult(chatIdStr, line, env);
       if (msg && settings.botMsgTtlSeconds > 0) {
         await scheduleDeletion(chatIdStr, msg.message_id, settings.botMsgTtlSeconds / 60, env);
+        await scheduleDeletion(chatIdStr, message.message_id, settings.botMsgTtlSeconds / 60, env);
       }
       break;
     }
@@ -685,7 +676,9 @@ async function handleGroupCommand(
         env
       );
       if (m && settings.botMsgTtlSeconds > 0) {
-        await scheduleDeletion(chatIdStr, m.message_id, settings.botMsgTtlSeconds / 60, env);
+        const mins = settings.botMsgTtlSeconds / 60;
+        await scheduleDeletion(chatIdStr, m.message_id, mins, env);
+        await scheduleDeletion(chatIdStr, message.message_id, mins, env);
       }
       break;
     }
@@ -694,9 +687,15 @@ async function handleGroupCommand(
       if (!message.reply_to_message || !message.reply_to_message.from) return;
       const target = message.reply_to_message.from;
       await unmuteUser(chatIdStr, target.id, env);
-      const m = await sendTextWithResult(chatIdStr, `🔊 Unmuted ${formatUserTag(target)}.`, env);
+      const m = await sendTextWithResult(
+        chatIdStr,
+        `🔊 Unmuted ${formatUserTag(target)}.`,
+        env
+      );
       if (m && settings.botMsgTtlSeconds > 0) {
-        await scheduleDeletion(chatIdStr, m.message_id, settings.botMsgTtlSeconds / 60, env);
+        const mins = settings.botMsgTtlSeconds / 60;
+        await scheduleDeletion(chatIdStr, m.message_id, mins, env);
+        await scheduleDeletion(chatIdStr, message.message_id, mins, env);
       }
       break;
     }
@@ -705,6 +704,9 @@ async function handleGroupCommand(
       if (!message.reply_to_message || !message.reply_to_message.from) return;
       const target = message.reply_to_message.from;
       await handleViolation(chat.id, target, "manual", env);
+      if (settings.botMsgTtlSeconds > 0) {
+        await scheduleDeletion(chatIdStr, message.message_id, settings.botMsgTtlSeconds / 60, env);
+      }
       break;
     }
 
@@ -720,7 +722,9 @@ async function handleGroupCommand(
       const textOut = `✅ Removed one warning from ${label}. Current warnings: ${newCount}/${settings.warnThreshold}.`;
       const m = await sendTextWithResult(chatIdStr, textOut, env);
       if (m && settings.botMsgTtlSeconds > 0) {
-        await scheduleDeletion(chatIdStr, m.message_id, settings.botMsgTtlSeconds / 60, env);
+        const mins = settings.botMsgTtlSeconds / 60;
+        await scheduleDeletion(chatIdStr, m.message_id, mins, env);
+        await scheduleDeletion(chatIdStr, message.message_id, mins, env);
       }
       break;
     }
@@ -728,9 +732,11 @@ async function handleGroupCommand(
     case "/del": {
       if (!message.reply_to_message) return;
       const targetMsgId = message.reply_to_message.message_id;
-      const delay = parseDuration(args[0] || "10s");
+      const delay = parseDuration(args[0] || "10s"); // minutes
 
+      // delete replied message, /del command, and info message after the same delay
       await scheduleDeletion(chatIdStr, targetMsgId, delay, env);
+      await scheduleDeletion(chatIdStr, message.message_id, delay, env);
 
       const info = await sendTextWithResult(
         chatIdStr,
@@ -740,7 +746,6 @@ async function handleGroupCommand(
       if (info) {
         await scheduleDeletion(chatIdStr, info.message_id, delay, env);
       }
-
       break;
     }
 
