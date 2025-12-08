@@ -171,15 +171,18 @@ async function handleMessage(message: TgMessage, env: Env): Promise<void> {
   const user = message.from;
   if (!user) return;
 
-  if (settings.antiforward && isForwarded(message)) {
+  const isPrivileged = isOwnerOrAllowed(env, message);
+
+  // ⚙️ Moderation should NOT affect owner/allowed IDs
+  if (!isPrivileged && settings.antiforward && isForwarded(message)) {
     await deleteMessage(chatIdStr, message.message_id, env);
-    await handleViolation(chat.id, user.id, "forward", env, message);
+    await handleViolation(chat.id, user, "forward", env);
     return;
   }
 
-  if (settings.antilink && containsForbiddenLink(text, settings.whitelist)) {
+  if (!isPrivileged && settings.antilink && containsForbiddenLink(text, settings.whitelist)) {
     await deleteMessage(chatIdStr, message.message_id, env);
-    await handleViolation(chat.id, user.id, "link", env, message);
+    await handleViolation(chat.id, user, "link", env);
     return;
   }
 }
@@ -302,13 +305,12 @@ async function saveGroupRules(chatId: number, rules: string, env: Env): Promise<
 
 async function handleViolation(
   chatId: number,
-  userId: number,
+  user: TgUser,
   reason: "link" | "forward" | "manual",
-  env: Env,
-  contextMessage: TgMessage
+  env: Env
 ): Promise<void> {
   const settings = await getGroupSettings(chatId, env);
-  const warnKey = WARN_PREFIX + String(chatId) + ":" + String(userId);
+  const warnKey = WARN_PREFIX + String(chatId) + ":" + String(user.id);
 
   const current = (await env.BOT_CONFIG.get(warnKey)) || "0";
   const count = parseInt(current, 10) || 0;
@@ -325,15 +327,19 @@ async function handleViolation(
       ? "forwarding messages/stories"
       : "breaking the rules";
 
-  const warnText = `⚠️ Warning ${newCount}/${settings.warnThreshold} for user ${userId} (${reasonText}).`;
+  const userLabel = formatUserTag(user);
+
+  const warnText = `⚠️ Warning ${newCount}/${settings.warnThreshold} for ${userLabel} (${reasonText}).`;
 
   await sendEphemeralText(chatIdStr, warnText, settings.botMsgTtlSeconds, env);
 
   if (newCount >= settings.warnThreshold) {
-    await muteUser(chatIdStr, userId, settings.autoMuteMinutes, env);
+    await muteUser(chatIdStr, user.id, settings.autoMuteMinutes, env);
     await env.BOT_CONFIG.put(warnKey, "0");
 
-    const muteText = `🔇 User ${userId} has been muted for ${settings.autoMuteMinutes} minutes after ${settings.warnThreshold} warnings (${reasonText}).`;
+    const muteText = `🔇 ${userLabel} has been muted for ${formatDurationFromMinutes(
+      settings.autoMuteMinutes
+    )} after ${settings.warnThreshold} warnings (${reasonText}).`;
     await sendEphemeralText(chatIdStr, muteText, settings.botMsgTtlSeconds, env);
   }
 }
@@ -390,6 +396,7 @@ async function handlePrivateMessage(message: TgMessage, env: Env): Promise<void>
         "/mute <time> (reply) – mute user (10s/10m/1h/1d etc)",
         "/unmute (reply) – unmute user",
         "/warn (reply) – manual warn",
+        "/dwarn (reply) – remove one warning from a user",
         "/del <time> (reply) – delete that message after a delay"
       ].join("\n");
       await sendText(chatIdStr, help, env);
@@ -427,7 +434,7 @@ async function handlePrivateMessage(message: TgMessage, env: Env): Promise<void>
         `joinclean: ${settings.autoDeleteJoin}`,
         `leaveclean: ${settings.autoDeleteLeave}`,
         `warnThreshold: ${settings.warnThreshold}`,
-        `autoMuteMinutes: ${settings.autoMuteMinutes}`,
+        `autoMute: ${formatDurationFromMinutes(settings.autoMuteMinutes)}`,
         `botMsgTtlSeconds: ${settings.botMsgTtlSeconds}`,
         `whitelist: ${settings.whitelist.length ? settings.whitelist.join(", ") : "(none)"}`
       ];
@@ -661,8 +668,8 @@ async function handleGroupCommand(
     case "/status": {
       const line = `Status – antilink: ${settings.antilink}, antiforward: ${settings.antiforward}, joinclean: ${settings.autoDeleteJoin}, leaveclean: ${settings.autoDeleteLeave}`;
       const msg = await sendTextWithResult(chatIdStr, line, env);
-      if (msg) {
-        await scheduleDeletion(chatIdStr, msg.message_id, settings.botMsgTtlSeconds, env);
+      if (msg && settings.botMsgTtlSeconds > 0) {
+        await scheduleDeletion(chatIdStr, msg.message_id, settings.botMsgTtlSeconds / 60, env);
       }
       break;
     }
@@ -674,11 +681,11 @@ async function handleGroupCommand(
       await muteUser(chatIdStr, target.id, duration, env);
       const m = await sendTextWithResult(
         chatIdStr,
-        `🔇 Muted ${displayName(target)} for ${args[0] || "24h"}.`,
+        `🔇 Muted ${formatUserTag(target)} for ${args[0] || "24h"}.`,
         env
       );
-      if (m) {
-        await scheduleDeletion(chatIdStr, m.message_id, settings.botMsgTtlSeconds, env);
+      if (m && settings.botMsgTtlSeconds > 0) {
+        await scheduleDeletion(chatIdStr, m.message_id, settings.botMsgTtlSeconds / 60, env);
       }
       break;
     }
@@ -687,9 +694,9 @@ async function handleGroupCommand(
       if (!message.reply_to_message || !message.reply_to_message.from) return;
       const target = message.reply_to_message.from;
       await unmuteUser(chatIdStr, target.id, env);
-      const m = await sendTextWithResult(chatIdStr, `🔊 Unmuted ${displayName(target)}.`, env);
-      if (m) {
-        await scheduleDeletion(chatIdStr, m.message_id, settings.botMsgTtlSeconds, env);
+      const m = await sendTextWithResult(chatIdStr, `🔊 Unmuted ${formatUserTag(target)}.`, env);
+      if (m && settings.botMsgTtlSeconds > 0) {
+        await scheduleDeletion(chatIdStr, m.message_id, settings.botMsgTtlSeconds / 60, env);
       }
       break;
     }
@@ -697,7 +704,24 @@ async function handleGroupCommand(
     case "/warn": {
       if (!message.reply_to_message || !message.reply_to_message.from) return;
       const target = message.reply_to_message.from;
-      await handleViolation(chat.id, target.id, "manual", env, message);
+      await handleViolation(chat.id, target, "manual", env);
+      break;
+    }
+
+    case "/dwarn": {
+      if (!message.reply_to_message || !message.reply_to_message.from) return;
+      const target = message.reply_to_message.from;
+      const warnKey = WARN_PREFIX + String(chat.id) + ":" + String(target.id);
+      const current = (await env.BOT_CONFIG.get(warnKey)) || "0";
+      const count = parseInt(current, 10) || 0;
+      const newCount = Math.max(0, count - 1);
+      await env.BOT_CONFIG.put(warnKey, String(newCount));
+      const label = formatUserTag(target);
+      const textOut = `✅ Removed one warning from ${label}. Current warnings: ${newCount}/${settings.warnThreshold}.`;
+      const m = await sendTextWithResult(chatIdStr, textOut, env);
+      if (m && settings.botMsgTtlSeconds > 0) {
+        await scheduleDeletion(chatIdStr, m.message_id, settings.botMsgTtlSeconds / 60, env);
+      }
       break;
     }
 
@@ -892,4 +916,20 @@ function displayName(user: TgUser): string {
   const full = `${user.first_name || ""} ${user.last_name || ""}`.trim();
   if (full) return full;
   return String(user.id);
+}
+
+function formatUserTag(user: TgUser): string {
+  return `${displayName(user)} (${user.id})`;
+}
+
+function formatDurationFromMinutes(minutes: number): string {
+  if (minutes % (60 * 24) === 0) {
+    const days = minutes / (60 * 24);
+    return `${days}d`;
+  }
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return `${hours}h`;
+  }
+  return `${minutes}m`;
 }
