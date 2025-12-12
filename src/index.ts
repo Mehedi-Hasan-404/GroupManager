@@ -41,9 +41,6 @@ interface TgMessage {
   forward_from_message_id?: number;
   forward_date?: number;
 
-  entities?: any[];
-  caption_entities?: any[];
-
   [k: string]: any;
 }
 
@@ -174,13 +171,11 @@ async function handleMessage(message: TgMessage, env: Env): Promise<void> {
     return;
   }
 
-  // <-- HERE: use regex-based detection (aggressive)
-  if (!isPrivileged && settings.antilink && containsForbiddenLinkRegex(text, settings.whitelist)) {
+  if (!isPrivileged && settings.antilink && containsForbiddenLink(text, settings.whitelist)) {
     await deleteMessage(chatIdStr, message.message_id, env);
     await handleViolation(chat.id, user, "link", env);
     return;
   }
-  // -->
 }
 
 async function handleMyChatMember(update: any, env: Env): Promise<void> {
@@ -225,6 +220,29 @@ async function handleMyChatMember(update: any, env: Env): Promise<void> {
   } catch {
     return;
   }
+}
+
+function containsForbiddenLink(text: string, whitelist: string[]): boolean {
+  const lower = text.toLowerCase();
+  const hasLink =
+    /https?:\/\/\S+/i.test(text) ||
+    /www\.\S+\.\S+/i.test(text) ||
+    /\b[\w-]+\.(com|net|org|io|gg|xyz|info|biz|co|me|app|online|shop|live)(\/\S*)?/i.test(text) ||
+    /t\.me\/\S+/i.test(text) ||
+    /telegram\.me\/\S+/i.test(text) ||
+    /\bdiscord\.gg\/\S+/i.test(text);
+
+  if (!hasLink) return false;
+
+  for (const domain of whitelist) {
+    const d = domain.toLowerCase().trim();
+    if (!d) continue;
+    if (lower.includes(d)) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function isForwarded(msg: TgMessage): boolean {
@@ -919,118 +937,4 @@ function formatDurationFromMinutes(minutes: number): string {
     return `${hours}h`;
   }
   return `${minutes}m`;
-}
-
-/* ---------------------------------------------------------------------------
-   BELOW: Regex-heavy "could-be-a-link" detector (aggressive)
-   - Matches domain-like tokens: go.to, is.ji, foo.bar/baz, with/without scheme
-   - Whitelist supports domain strings or full URLs; bare example.com allows subdomains
-   --------------------------------------------------------------------------- */
-
-// Broad domain-like regex (matches go.to, is.ji, jkkkhgj.jjgfg, www.foo.bar, http://x.y, foo.bar/path)
-const BROAD_DOMAIN_RE = /\b(?:(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.)+(?:[a-z]{1,63}|xn--[a-z0-9-]{1,59})(?::\d{1,5})?(?:\/[^\s]*)?\b/iu;
-
-// Also match obvious scheme-based links and www
-const URL_SCHEME_RE = /https?:\/\/[^\s/$.?#].[^\s]*/i;
-const WWW_RE = /\bwww\.[^\s/$.?#].[^\s]*/i;
-// common chat invite patterns
-const INVITE_RE = /\b(?:t\.me\/|telegram\.me\/|discord\.gg\/|discord\.com\/invite\/)[A-Za-z0-9_-]{1,}\b/i;
-
-/**
- * Compare hostname against whitelist entries.
- * whitelist entries can be plain hostnames (example.com) or full URLs.
- * Bare "example.com" will match example.com and sub.example.com (subdomain allowed).
- * Leading dot (".example.com") explicitly allows subdomains & base domain.
- */
-function hostnameMatchesWhitelist(hostname: string, whitelist: string[]): boolean {
-  const host = hostname.toLowerCase();
-  for (const raw of whitelist) {
-    if (!raw) continue;
-    const w = raw.trim().toLowerCase();
-    // explicit leading dot means allow subdomains (".example.com")
-    if (w.startsWith(".")) {
-      const trimmed = w.slice(1);
-      if (host === trimmed || host.endsWith("." + trimmed)) return true;
-      continue;
-    }
-
-    // direct string match or subdomain match
-    if (host === w || host.endsWith("." + w)) return true;
-
-    // try parse if whitelist entry is a URL
-    try {
-      const parsed = new URL(w.startsWith("http") ? w : `http://${w}`);
-      const ph = parsed.hostname.toLowerCase();
-      if (host === ph || host.endsWith("." + ph)) return true;
-    } catch {
-      // ignore parse error
-    }
-  }
-  return false;
-}
-
-/**
- * Regex-only detection of "could be a link".
- * msgText: the message text or caption
- * whitelist: array of allowed domains or URLs
- *
- * Returns true if the message contains something that looks like a link and is NOT whitelisted.
- */
-function containsForbiddenLinkRegex(msgText: string, whitelist: string[]): boolean {
-  if (!msgText || !msgText.trim()) return false;
-  const text = msgText;
-
-  // Fast path: if no likely patterns, skip heavy extraction
-  if (!URL_SCHEME_RE.test(text) && !WWW_RE.test(text) && !INVITE_RE.test(text) && !BROAD_DOMAIN_RE.test(text)) {
-    return false;
-  }
-
-  // Collect broad domain-like candidates
-  const candidates = new Set<string>();
-  let m: RegExpExecArray | null;
-  BROAD_DOMAIN_RE.lastIndex = 0;
-  while ((m = BROAD_DOMAIN_RE.exec(text)) !== null) {
-    const match = m[0];
-    if (match && match.length > 0) candidates.add(match);
-    // avoid infinite loop (defensive)
-    if (BROAD_DOMAIN_RE.lastIndex === m.index) BROAD_DOMAIN_RE.lastIndex++;
-  }
-
-  // If invite patterns present, add them explicitly (they may not always be matched by BROAD_DOMAIN_RE)
-  let im: RegExpExecArray | null;
-  INVITE_RE.lastIndex = 0;
-  while ((im = INVITE_RE.exec(text)) !== null) {
-    if (im[0]) candidates.add(im[0]);
-    if (INVITE_RE.lastIndex === im.index) INVITE_RE.lastIndex++;
-  }
-
-  // If nothing extracted, nothing to block
-  if (candidates.size === 0) return false;
-
-  // For each candidate, parse hostname (prepend http:// if missing) and compare to whitelist.
-  for (const candidate of candidates) {
-    const toParse = /^[a-z][a-z0-9+.-]*:\/\//i.test(candidate) ? candidate : `http://${candidate}`;
-
-    try {
-      const u = new URL(toParse);
-      const hostname = (u.hostname || "").toLowerCase();
-
-      if (!hostname) {
-        // treat as suspicious if hostname missing
-        return true;
-      }
-
-      if (!hostnameMatchesWhitelist(hostname, whitelist || [])) {
-        // candidate not whitelisted -> forbidden
-        return true;
-      }
-      // else candidate is whitelisted -> continue checking others
-    } catch {
-      // URL parsing failed: treat candidate as forbidden (conservative)
-      return true;
-    }
-  }
-
-  // no forbidden candidates found
-  return false;
 }
